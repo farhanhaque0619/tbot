@@ -66,8 +66,7 @@ class RollingATR:
 
 
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    """Vectorised Wilder ATR (matches RollingATR)."""
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()], axis=1).max(axis=1)
-    tr.iloc[0] = df["high"].iloc[0] - df["low"].iloc[0]
-    return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    """Wilder ATR over a frame; identical to feeding RollingATR bar by bar."""
+    r = RollingATR(n)
+    vals = [r.update(h, l, c) for h, l, c in zip(df["high"].to_numpy(), df["low"].to_numpy(), df["close"].to_numpy())]
+    return pd.Series([float("nan") if v is None else v for v in vals], index=df.index, name="atr")

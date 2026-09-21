@@ -28,17 +28,18 @@ def now_ny() -> datetime:
 
 def to_ny(ts) -> pd.Timestamp:
     ts = pd.Timestamp(ts)
-    return ts.tz_localize(UTC).tz_convert(NY) if ts.tzinfo is None else ts.tz_convert(NY)
+    return ts.tz_localize("UTC").tz_convert(NY_TZ) if ts.tzinfo is None else ts.tz_convert(NY_TZ)
 
 
 def to_ny_index(idx: pd.Index) -> pd.DatetimeIndex:
-    idx = pd.DatetimeIndex(idx)
-    return idx.tz_localize(UTC).tz_convert(NY) if idx.tz is None else idx.tz_convert(NY)
+    idx = pd.DatetimeIndex(idx).as_unit("ns")  # DuckDB hands back microseconds; keep one unit everywhere
+    # Use the tz *name* so we get the same tz implementation pandas picks for string zones.
+    return idx.tz_localize("UTC").tz_convert(NY_TZ) if idx.tz is None else idx.tz_convert(NY_TZ)
 
 
 def daily_ts(d: date) -> pd.Timestamp:
     """Canonical timestamp for a daily bar: midnight New York time on that date."""
-    return pd.Timestamp(datetime.combine(d, time(0, 0)), tz=NY)
+    return pd.Timestamp(datetime.combine(d, time(0, 0))).tz_localize(NY_TZ)
 
 
 @dataclass(frozen=True)

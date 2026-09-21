@@ -9,6 +9,7 @@ from typing import Protocol
 import pandas as pd
 
 from bot.config import Settings
+from bot.config import NY_TZ
 from bot.data.calendar import NY, UTC, daily_ts, to_ny_index
 from bot.data.store import BAR_COLUMNS
 from bot.utils.retry import with_retry
@@ -119,11 +120,11 @@ class CsvBarProvider:
         df = df.dropna(subset=["close"])
         idx = pd.DatetimeIndex(df.index)
         if idx.tz is not None:
-            idx = idx.tz_convert(NY)
+            idx = idx.tz_convert(NY_TZ)
         df.index = pd.DatetimeIndex([daily_ts(t.date()) for t in idx], name="ts")
         df = df[~df.index.duplicated(keep="last")]
         return df.loc[daily_ts(start): daily_ts(end)].astype(float)
 
 
 def _empty() -> pd.DataFrame:
-    return pd.DataFrame(columns=BAR_COLUMNS, index=pd.DatetimeIndex([], tz=NY, name="ts"))
+    return pd.DataFrame(columns=BAR_COLUMNS, index=pd.DatetimeIndex([], tz=NY_TZ, name="ts"))

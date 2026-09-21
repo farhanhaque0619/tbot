@@ -177,7 +177,7 @@ class PaperTrader:
             log.info("%s %s: target %+d matches position; nothing to do (%s)", session_date, sym, desired, reason)
         elif cur_side != 0:
             side = "sell" if cur_side == 1 else "buy"
-            action = self._submit(sym, abs(bpos.qty), side, session_date, "exit", reason, stop=None)
+            action = self._submit(sym, abs(bpos.qty), side, session_date, "exit", reason, stop=None, tif=tif)
         else:
             n_open = len(positions) + sum(1 for o in self.state.orders.values()
                                           if o.get("kind") == "entry" and o.get("status") in ("submitting", "new", "accepted", "pending_new"))
@@ -189,7 +189,7 @@ class PaperTrader:
                 qty = self.risk.position_qty(equity, last_close, stop_dist, cash_available=cash if desired == 1 else None)
                 if qty > 0:
                     stop = last_close - desired * stop_dist
-                    action = self._submit(sym, qty, "buy" if desired == 1 else "sell", session_date, "entry", reason, stop=stop)
+                    action = self._submit(sym, qty, "buy" if desired == 1 else "sell", session_date, "entry", reason, stop=stop, tif=tif)
                 else:
                     log.info("%s: sized to 0 shares (equity %.2f, price %.2f); skipping", sym, equity, last_close)
         self.state.last_processed[sym] = session_date.isoformat()
@@ -211,12 +211,12 @@ class PaperTrader:
         return desired, reason
 
     # ---------------------------------------------------------------- orders
-    def _submit(self, sym: str, qty: int, side: str, session_date: date, kind: str, reason: str, stop: float | None) -> str:
+    def _submit(self, sym: str, qty: int, side: str, session_date: date, kind: str, reason: str, stop: float | None,
+                tif: str) -> str | None:
         cid = f"{self.run_id}-{sym}-{session_date.isoformat()}-{kind}"
         if cid in self.state.orders and self.state.orders[cid].get("status") not in ("lost",):
             log.warning("%s: order %s already recorded (status %s); not resubmitting", sym, cid, self.state.orders[cid].get("status"))
             return None
-        tif = self._pick_tif(now_ny()) or self.settings.order_time_in_force
         rec = {"client_order_id": cid, "symbol": sym, "qty": qty, "side": side, "kind": kind, "reason": reason,
                "status": "submitting", "tif": tif, "session": session_date.isoformat(), "submitted_at": now_ny().isoformat()}
         self.state.orders[cid] = rec

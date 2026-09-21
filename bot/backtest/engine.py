@@ -180,7 +180,7 @@ class Backtester:
                         continue
                     cash -= order.side * qty * fill + self.costs.commission(qty)
                     positions[sym] = _Position(sym, order.side, qty, ts, fill,
-                                               entry_cost=qty * abs(fill - o) + self.costs.commission(qty),
+                                               entry_cost=self.costs.commission(qty),  # slippage is already in `fill`
                                                stop=order.stop, entry_reason=order.reason)
 
             # 2. mark to market at close ------------------------------------------------------
