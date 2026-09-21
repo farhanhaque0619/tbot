@@ -199,7 +199,7 @@ class Backtester:
                 for ev in risk.update_equity(ts, equity):
                     if ev.kind != "new_day":
                         risk_events.append(ev)
-                        log.info("risk event %s at %s: %s", ev.kind, ts.date(), ev.detail)
+                        log.debug("risk event %s at %s: %s", ev.kind, ts.date(), ev.detail)
 
             # 3. kill switch -> liquidate everything at the next open, stop trading ---------
             if risk.killed and not killed_liquidating:
@@ -225,6 +225,22 @@ class Backtester:
                     continue
                 self._handle_signal(sig, sym, ts, bar, positions, pending, risk, equity, cash, atrs[sym].atr)
 
+        # Close whatever is still open at the last bar's close (with exit costs) so that the trade list
+        # and the equity curve tell the same story. Marked "end of backtest" in the trade log.
+        if positions:
+            last_ts = ts_hist[-1]
+            for sym, p in list(positions.items()):
+                fill = self.costs.fill_price(last_close[sym], -p.side)
+                comm = self.costs.commission(p.qty)
+                cash += p.side * p.qty * fill - comm  # sell a long / buy back a short
+                pnl = p.side * (fill - p.entry_price) * p.qty - p.entry_cost - comm
+                costs_paid += p.qty * abs(fill - last_close[sym]) + comm
+                n_orders += 1
+                trades.append(Trade(sym, p.side, p.qty, p.entry_ts, p.entry_price, last_ts, fill, pnl,
+                                    pnl / (p.entry_price * p.qty), p.bars_held, p.entry_reason, "end of backtest"))
+            positions.clear()
+            equity_hist[-1] = cash
+            cash_hist[-1] = cash
         equity_s = pd.Series(equity_hist, index=pd.DatetimeIndex(ts_hist), name="equity")
         cash_s = pd.Series(cash_hist, index=equity_s.index, name="cash")
         # Only the trading window counts for metrics (warm-up bars are flat by construction).
@@ -235,6 +251,8 @@ class Backtester:
         metrics = compute_metrics(eq_w, trades, exposure=exposure)
         metrics["costs_paid"] = costs_paid
         metrics["orders"] = n_orders
+        metrics["daily_halts"] = sum(1 for e in risk_events if e.kind == "daily_halt")
+        metrics["kill_switch"] = bool(risk.killed)
         result = BacktestResult(strategy_name, params, symbols, eq_w, cash_s[window], trades, metrics,
                                 risk_events=risk_events, killed=risk.killed, orders=n_orders,
                                 costs_paid=costs_paid, exposure=exposure)

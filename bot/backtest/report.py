@@ -23,6 +23,10 @@ def _json_safe(o: Any):
     return str(o)
 
 
+def _params(p: dict[str, Any]) -> str:
+    return ",".join(f"{k}={v}" for k, v in p.items())
+
+
 def metrics_table(title: str, metrics: dict[str, Any], benchmark: dict[str, Any] | None = None) -> Table:
     t = Table(title=title, show_header=True, header_style="bold")
     t.add_column("Metric")
@@ -63,7 +67,7 @@ def print_backtest(res: BacktestResult, console: Console | None = None) -> None:
     console = console or Console()
     title = f"{res.strategy} {res.params} on {', '.join(res.symbols)}"
     console.print(metrics_table(title, res.metrics, res.benchmark_metrics))
-    console.print(f"Costs paid: {res.costs_paid:,.2f}  ·  orders: {res.orders}")
+    console.print(f"Costs paid: {res.costs_paid:,.2f}  ·  orders: {res.orders}  ·  daily-loss halts: {res.metrics.get('daily_halts', 0)}")
     for n in res.notes:
         console.print(f"[bold red]{n}[/bold red]")
     console.print(f"[bold]Verdict:[/bold] {verdict(res.metrics, res.benchmark_metrics)}")
@@ -77,7 +81,7 @@ def print_walkforward(wf: WalkForwardResult, console: Console | None = None) -> 
     for f in wf.folds:
         m, b = f.test_result.metrics, f.test_result.benchmark_metrics
         ft.add_row(f"{f.train_start.date()}→{f.train_end.date()}", f"{f.test_start.date()}→{f.test_end.date()}",
-                   str(f.best_params), f"{f.train_metrics['sharpe']:.2f}", f"{m['total_return']:+.1%}", f"{m['sharpe']:.2f}",
+                   _params(f.best_params), f"{f.train_metrics['sharpe']:.2f}", f"{m['total_return']:+.1%}", f"{m['sharpe']:.2f}",
                    f"{m['max_drawdown']:.1%}", str(m["trade_count"]), f"{b['total_return']:+.1%}" if b else "-")
     console.print(ft)
     console.print(metrics_table(f"OUT-OF-SAMPLE (stitched) · {wf.strategy} on {', '.join(wf.symbols)}", wf.oos_metrics, wf.benchmark_metrics))

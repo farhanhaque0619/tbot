@@ -70,3 +70,19 @@ def test_multi_symbol_respects_max_positions():
     res = Backtester(OneRoundTrip, costs=CostModel(0, 0), risk=risk, benchmark=True).run(dfs)
     assert len(res.trades) == 2
     assert res.benchmark_equity is not None and len(res.benchmark_equity) == len(res.equity)
+
+
+def test_open_position_is_closed_at_end_of_run_and_equity_agrees():
+    """A position still open on the last bar is closed at that bar's close (with exit costs),
+    so final equity == initial + sum(trade pnl) and the equity curve never jumps."""
+    df = make_bars(30, seed=13)
+    costs = CostModel(slippage_bps=10, spread_bps=10)
+    risk = RiskLimits(risk_per_trade_pct=0.01, max_position_pct=1.0, atr_stop_mult=1000, max_drawdown_pct=0.9, daily_loss_limit_pct=0.9)
+    res = Backtester(lambda: OneRoundTrip(entry=5, exit=999), costs=costs, risk=risk, benchmark=False).run({"X": df})
+    assert len(res.trades) == 1 and res.trades[0].exit_reason == "end of backtest"
+    t = res.trades[0]
+    assert t.exit_ts == df.index[-1]
+    assert t.exit_price == pytest.approx(df["close"].iloc[-1] * (1 - 0.0015))
+    assert res.equity.iloc[-1] == pytest.approx(100_000 + t.pnl)
+    # the liquidation only costs the exit slippage: last two equity marks differ by less than 0.5%
+    assert abs(res.equity.iloc[-1] / res.equity.iloc[-2] - 1) < 0.005 + abs(df["close"].iloc[-1] / df["close"].iloc[-2] - 1)

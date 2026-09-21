@@ -133,7 +133,8 @@ def walk_forward(strategy_cls: type[Strategy], data: dict[str, pd.DataFrame], *,
         bench = (1 + brets).cumprod() * initial_cash
         bench_m = compute_metrics(bench)
     notes = [f"{len(folds)} folds, train {train_years}y / test {test_years}y, selected by train {select_metric} (min {min_trades} trades)",
-             "Folds are stitched by compounding daily returns; positions do not carry across fold boundaries."]
+             "Folds are stitched by compounding daily returns; positions and risk state (peak equity, kill switch) "
+             "reset at each fold boundary, and positions still open at a fold's end are closed at its last bar."]
     killed = [f for f in folds if f.test_result.killed]
     if killed:
         notes.append(f"Kill switch tripped in {len(killed)} test fold(s): " + ", ".join(str(f.test_start.date()) for f in killed))
