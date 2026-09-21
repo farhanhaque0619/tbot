@@ -1,0 +1,21 @@
+# secrets
+.env
+*.env
+!.env.example
+
+# runtime data / state / logs
+data_cache/
+state/
+logs/
+reports/*.csv
+reports/*.json
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/

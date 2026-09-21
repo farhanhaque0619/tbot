@@ -1,0 +1,9 @@
+alpaca-py==0.44.0
+pandas==2.3.3
+numpy==2.4.6
+duckdb==1.5.5
+pydantic==2.13.5
+pydantic-settings==2.15.0
+python-dotenv==1.1.1
+requests==2.34.2
+rich==14.1.0

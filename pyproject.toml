@@ -1,0 +1,13 @@
+[project]
+name = "tbot"
+version = "0.1.0"
+description = "Research-grade automated trading bot: backtesting + Alpaca paper trading"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.setuptools.packages.find]
+include = ["bot*"]
