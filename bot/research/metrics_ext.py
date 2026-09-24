@@ -7,7 +7,7 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
-from bot.backtest.metrics import TRADING_DAYS, compute_metrics
+from bot.backtest.metrics import compute_metrics
 
 
 def time_underwater(equity: pd.Series) -> tuple[float, int]:

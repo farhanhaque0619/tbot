@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 
 from bot.data.quality import check_frame
 from tests.conftest import make_bars

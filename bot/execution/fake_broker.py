@@ -161,7 +161,8 @@ class FakeBroker:
             raise FakeAPIError(f"{symbol} is not fractionable", 422)
         status = "new"
         if self._reject_next:
-            status, reason = "rejected", self._reject_next.pop(0)
+            status = "rejected"
+            self._reject_next.pop(0)
         elif side == "buy" and q * self.prices[symbol] > self.cash + 1e-9:
             status = "rejected"   # insufficient buying power (Alpaca actually returns HTTP 403; we model the terminal state)
         o = OrderInfo(str(next(self._ids)), client_order_id, symbol, side, q, status, 0.0, None, self.now, None, None, tif)

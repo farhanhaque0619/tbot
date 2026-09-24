@@ -15,7 +15,7 @@ State is a plain dataclass so it can be persisted and restored across restarts.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 

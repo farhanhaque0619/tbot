@@ -179,7 +179,6 @@ def test_stale_state_recovery_adopts_broker_positions(env, tmp_path):
 
 def test_weekend_and_holiday_resolve_to_last_completed_session(env):
     from bot.data.calendar import SessionInfo, last_completed_session_date
-    from datetime import time
     sat = datetime(2024, 1, 6, 12, 0, tzinfo=NY)
     assert last_completed_session_date(sat) == date(2024, 1, 5)
     # MLK day 2024-01-15: broker calendar has no session that day
@@ -220,7 +219,7 @@ def test_stale_quote_blocks_day_order_but_not_opg(env):
     b.now = MON_OPEN
     t = env["make"]()
     # Monday 10:00 -> whole shares -> OPG window closed, market open -> DAY order -> quote must be fresh -> blocked
-    s = t.run_cycle(MON_OPEN)
+    t.run_cycle(MON_OPEN)
     recs = DecisionLog(env["tmp"] / "d.jsonl").read()
     # No Monday bar exists yet in the cache so the session is Friday's; the decision is made with a stale quote.
     assert not b.submitted and recs[-1]["order_decision"] == "blocked" and recs[-1]["risk_decision"]["code"] == "data_fresh"

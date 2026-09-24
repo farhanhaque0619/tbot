@@ -3,7 +3,6 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from bot.config import Settings
 from bot.data.calendar import NY, daily_ts, is_opg_window, last_completed_session_date

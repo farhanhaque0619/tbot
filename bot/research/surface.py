@@ -25,7 +25,7 @@ class SurfaceResult:
 
     def render_markdown(self) -> str:
         cols = [c for c in self.table.columns]
-        out = [f"| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
+        out = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
         for _, r in self.table.iterrows():
             out.append("| " + " | ".join(f"{v:.3f}" if isinstance(v, float) else str(v) for v in r.values) + " |")
         out.append(f"\nbest: {self.best} · neighbour/best {self.metric} ratio: {self.neighbour_ratio:.2f} · "

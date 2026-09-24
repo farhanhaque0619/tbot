@@ -39,7 +39,7 @@ from bot.execution.state import BotState, StateStore
 from bot.monitoring.alerts import Alerter
 from bot.monitoring.decisions import DecisionLog, DecisionRecord
 from bot.monitoring.logging import log_event
-from bot.risk.manager import OrderIntent, RiskDecision, RiskLimits, RiskManager, RiskState, SafeLiveLimits
+from bot.risk.manager import OrderIntent, RiskLimits, RiskManager, RiskState, SafeLiveLimits
 from bot.strategies.base import Bar, Strategy
 from bot.strategies.indicators import atr as atr_series
 

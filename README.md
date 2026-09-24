@@ -1,169 +1,141 @@
-# tbot — research-grade trading bot (backtest + Alpaca paper trading)
+# tbot — research-grade trading bot: backtests, Alpaca paper trading, gated live execution
 
-An event-driven backtester and a paper-trading loop for daily-bar strategies on
-US equities, built on the [Alpaca](https://alpaca.markets) paper API.
+> **PAPER IS DEFAULT. LIVE TRADING USES REAL MONEY. BACKTEST PERFORMANCE DOES NOT GUARANTEE FUTURE PERFORMANCE.**
 
-**This is infrastructure, not alpha.** The two bundled strategies are teaching
-baselines. See [REPORT.md](REPORT.md) for what the backtests actually show.
+## What this is
 
-```
-bot/
-  config.py          every setting from env vars / .env (pydantic-settings, SecretStr)
-  data/              Alpaca + CSV providers, DuckDB cache, NY-time helpers, split detection
-  strategies/        Strategy base class (on_bar), ma_crossover, mean_reversion, indicators
-  backtest/          event-driven engine (no lookahead), cost model, metrics, walk-forward, reports
-  risk/              fixed-fractional sizing, daily loss halt, drawdown kill switch, position cap
-  execution/         Alpaca broker (retry/backoff), fake broker, persisted state, paper loop
-  monitoring/        JSON-lines logging with secret redaction, CLI dashboard, Discord alerts
-  cli.py             python -m bot ...
-tests/               lookahead, risk, costs, restart safety, data cache
-scripts/load_sample_data.py   real historical bars without an Alpaca account (see below)
-```
+A small, deterministic Python 3.11 system that (1) backtests daily-bar strategies with an event-driven engine that
+cannot look ahead, (2) paper-trades them through the Alpaca API with crash-safe state and idempotent orders, and
+(3) can execute live only through a multi-gate interlock with hard dollar caps sized for a ~$100 validation account.
+A separate research layer compares strategies against cash and buy-and-hold and can never place an order.
 
-## Setup
+## What this is not
+
+- Not a profitable strategy. Two baselines ship (`ma_crossover`, `mean_reversion`); neither has demonstrated edge
+  (see **Evidence** below and REPORT.md / RESEARCH.md / STRATEGY_SPEC.md).
+- Not an AI trader. A shadow-mode advisor interface exists (`ENABLE_JEV=false`) whose output is logged and has no
+  code path to orders. Kelly sizing exists as a research function only (`ENABLE_KELLY=false`).
+- Not intraday, not options, not crypto, not margin, not short (in safe mode). Daily bars, US equities, long/flat.
+- Not tested against a real broker yet: as of 2026-09-24 the code has only run against the in-memory fake broker,
+  because the build environment cannot reach Alpaca. The first thing to do is Phase 3 of this README.
+
+## Strategies
+
+| Name | Rule (long/flat) | Params | Status |
+|---|---|---|---|
+| `ma_crossover` | long when SMA(close, 50) > SMA(close, 200), else flat | fast=50, slow=200 | baseline |
+| `mean_reversion` | long when z-score of close vs 20-day mean < −2.0, exit when z > −0.5 | lookback=20, entry_z=2.0, exit_z=0.5, allow_short=false | baseline |
+| research candidates (`donchian_breakout`, `ma_crossover_buffered`, `trend_vol_filter`) | see research/HYPOTHESES.md | | research only, not executable |
+
+Both baselines are sized by the risk layer (1% of equity at risk against a 2×ATR(14) stop, ≤50% of equity per
+position, no leverage) and exited by it when the stop is breached on a daily close. STRATEGY_SPEC.md has the exact
+rules, holding periods, turnover, failure regimes and parameter surfaces.
+
+## Evidence
+
+**Exists** (REPORT.md, RESEARCH.md; S&P 500 index proxy 2000–2022 close-only and GOOG 2005–2013 OHLCV, from bundled
+research datasets, 3 bps/side costs, walk-forward 3y/1y × 20 folds):
+
+| | ma_crossover | mean_reversion | buy & hold |
+|---|---|---|---|
+| Walk-forward OOS CAGR (S&P proxy) | +2.2% | +1.6% | +7.4% |
+| Walk-forward OOS Sharpe | 0.55 | 0.45 | 0.47 |
+| Walk-forward OOS max drawdown | −8.9% | −12.9% | −56.6% |
+| OOS trades over 20 years | 56 | 156 | – |
+| Parameter surface | stable | **fragile** | – |
+
+**Does not exist:** any result on SPY/QQQ from Alpaca; any real fill; any live or paper order; any evidence of
+alpha; any evidence that the 2×ATR stop is the right stop (it produces most exits — research/HYPOTHESES.md H4).
+
+## Setup and credentials
 
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt        # or requirements.txt without pytest
-cp .env.example .env                       # then paste your paper keys into .env
-python -m pytest                           # 38 tests, ~10 s, fully offline
+pip install -r requirements-dev.txt
+cp .env.example .env            # edit with an editor; never echo keys into a terminal
+python -m pytest -q             # 126 offline tests, ~1 min; 7 integration tests skip without credentials
 ```
 
-### Free Alpaca paper keys
+Paper keys: Alpaca dashboard → *Paper Trading* → *API Keys* → into `ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_SECRET_KEY`
+(they start with `PK`). Live keys → `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET_KEY` (start with `AK`). The bot refuses
+a key in the wrong slot. `.env`, `state/`, `logs/`, `data_cache/` are git-ignored; keys are `SecretStr` and a log
+filter redacts them; `python -m bot doctor` reports only *presence*, never values. If a key was ever pasted into
+a chat or screenshot, rotate it.
 
-1. Sign up at <https://app.alpaca.markets> (no funding needed).
-2. Switch the account toggle (top-left) to **Paper Trading**.
-3. Open *API Keys* on the right, click *Generate*, copy the key ID and secret.
-4. Put them in `.env` as `ALPACA_API_KEY` / `ALPACA_SECRET_KEY`.
-
-Paper keys only work against `https://paper-api.alpaca.markets`, which is what
-the bot uses unless you go through the live-trading gates described below.
-`.env` is git-ignored; keys are `SecretStr` and a log filter redacts them.
-
-## Run a backtest
+## Backtest
 
 ```bash
-python -m bot backtest --strategy ma_crossover --symbol SPY --start 2023-01-01 --end 2025-12-31
-python -m bot backtest --strategy mean_reversion --symbol SPY --symbol QQQ --start 2016-01-01 --end 2025-12-31 \
-    --param lookback=20 --param entry_z=2.0
+python -m bot backtest --strategy ma_crossover --symbol SPY --start 2015-01-01 --end 2025-12-31
+python -m bot backtest --strategy mean_reversion --symbol SPY --symbol QQQ --start 2016-01-01 --end 2025-12-31 --param lookback=20
+python -m bot research compare --symbol SPY --start 2015-01-01 --end 2025-12-31     # cash / B&H / baselines / candidates, cuts, regimes, walk-forward
+python -m bot research surface --strategy ma_crossover --symbol SPY --start 2015-01-01 --end 2025-12-31
+python -m bot data check --symbol SPY                                                # gaps, splits, duplicates, close-only
 ```
+Bars come from Alpaca (split-adjusted, SIP with IEX fallback) and are cached in DuckDB; DATA.md explains
+adjustments, holidays, time zones and lookahead protection. Without credentials: `python -m bot data import` (CSV) or
+`python scripts/load_sample_data.py` (bundled research datasets).
 
-What you get:
-
-- a full-period run with the given (or default) parameters, next to equal-weight buy-and-hold;
-- a **walk-forward** run: rolling 3-year train / 1-year test windows, the parameter
-  grid is searched on train only, the winner is run once on the following test year,
-  and the test years are stitched into one out-of-sample curve;
-- Sharpe, Sortino, CAGR, max drawdown, Calmar, win rate, profit factor, trade
-  count, time in market, costs paid, risk events; and a one-line verdict that says
-  "LOSES MONEY after costs" when it does;
-- CSV/JSON outputs in `reports/`.
-
-Bars are fetched from Alpaca on first use and cached in `data_cache/bars.duckdb`.
-Only missing date ranges are fetched afterwards; a small overlap is re-fetched
-each time and, if the cached adjusted prices disagree (a split happened), the
-symbol's history is discarded and refetched.
-
-Costs and risk limits come from `.env`: slippage + half-spread per side (default
-3 bps per side), fixed-fractional sizing (1% of equity at risk per trade, stop =
-2×ATR(14)), max 50% of equity per position, no leverage, daily loss halt at −3%,
-kill switch at −20% from peak equity, max 5 concurrent positions. The backtester
-and the paper loop share the same `RiskManager`.
-
-### Backtesting without Alpaca keys
-
-`python -m bot data import --symbol SPY --csv spy.csv` loads any daily CSV
-(date + open/high/low/close/volume, or close-only with `--close-column`).
-
-`python scripts/load_sample_data.py` loads real history that ships inside two
-PyPI wheels (downloaded, not installed): Google daily OHLCV 2004–2013, the S&P
-500 index and 20 large-cap stocks' daily closes 1990–2022, five factor ETFs
-2014–2022. Symbols: `GOOG`, `SP500`, `AAPL`, `MSFT`, … The close-only series get
-open = high = low = close, so fills happen at the next close instead of the next
-open. This is how the numbers in REPORT.md were produced.
-
-## Paper trade
+## Paper trading (default)
 
 ```bash
-python -m bot paper --strategy ma_crossover --symbol SPY --symbol QQQ          # long-running loop
-python -m bot paper --strategy ma_crossover --symbol SPY --once                # one cycle, cron-friendly
-python -m bot dashboard --watch 30                                             # equity, positions, trades, orders
-python -m bot status                                                           # account, positions, clock
-python -m bot risk show / python -m bot risk reset                             # kill switch state
+python -m bot doctor --paper                                    # connectivity + config health, read-only
+python -m bot status --paper                                    # account, positions, orders, clock, quote freshness
+python -m bot paper --strategy ma_crossover --symbol SPY --once  # one decision cycle
+python -m bot paper --strategy ma_crossover --symbol SPY         # loop (POLL_INTERVAL_SECONDS)
+python -m bot dashboard --watch 30
+python -m bot review --run-id paper                              # post-session report with proposals
 ```
+Cycle: sync fills → account/positions (broker is authoritative) → risk manager → last completed session → replay
+strategy → desired exposure vs actual → `RiskManager.check_order` → at most one market order per symbol per session
+with a deterministic client id (`paper-SPY-2025-01-15-entry`) → decision record in `logs/decisions_paper.jsonl`.
+Whole-share orders go market-on-open (19:00–09:28 ET); fractional orders (`ALLOW_FRACTIONAL=true`) go as day orders
+while the market is open. A restart cannot double-order: state is written before and after submission, and the
+broker refuses duplicate client ids. Real-broker integration tests: `RUN_ALPACA_INTEGRATION=1 python -m pytest tests/integration -s`.
 
-How a cycle works (daily bars):
+## Live trading (real money)
 
-1. Sync order status with the broker, book fills, record closed trades.
-2. Read account equity, feed the risk manager. A kill switch trip liquidates
-   everything, sends a critical alert, and refuses to trade until `risk reset`.
-3. Find the last completed session (Alpaca calendar). For each symbol not yet
-   processed for that session: load bars, replay the strategy over its warm-up
-   window, compute the desired exposure, apply the protective stop, compare with
-   the broker's actual position, and submit at most one order.
-4. Orders are market-on-open (`ORDER_TIME_IN_FORCE=opg`), submitted in Alpaca's
-   OPG window (19:00–09:28 ET) so they fill in the opening auction, matching the
-   backtester's "fill at next open" assumption. Between 16:00 and 19:00 the loop
-   waits; if the market is open it falls back to a `day` market order.
+Every one of these is required for a live order; any failure means no order:
+`ALPACA_LIVE_*` keys · `TRADING_ENV=live` · `--live` on the CLI · `python -m bot live arm` (typed
+`I UNDERSTAND THIS USES REAL MONEY` + `ACK` of the safe-mode table; expires after 30 min and on every restart) ·
+account endpoint confirms a non-paper account · `trading_blocked=false` · `account_blocked=false` · fresh market data
+· risk manager healthy · kill switch clear · `SAFE_LIVE_TEST_MODE` caps ($25/order, $50 gross, $5/day, $10 drawdown,
+1 position, SPY/QQQ only, no shorts/margin/extended hours). The multi-cycle live loop additionally needs
+`LIVE_AUTONOMOUS_TRADING=true`, which is `false` by default and which this repo never sets.
 
-Restart safety: state (`state/paper.json`) is written atomically before *and*
-after every submission; each order has a deterministic `client_order_id`
-(`paper-SPY-2025-01-15-entry`), which Alpaca refuses to accept twice. A crash at
-any point is recovered by looking the order up by that id. Positions closed
-outside the bot are detected and dropped from state; positions the bot did not
-open are adopted without a stop and logged.
-
-Monitoring: `logs/bot.jsonl` (structured events: orders, fills, risk events,
-errors) plus a readable console stream. Set `DISCORD_WEBHOOK_URL` to get alerts
-for orders, fills, daily halts, kill switch, and cycle errors.
-
-## Live trading is disabled
-
-`LIVE_TRADING=false` is the default. Turning it on requires all three:
-
-1. `LIVE_TRADING=true` in the environment,
-2. `--i-understand-live-trading` on the command line,
-3. typing `LIVE` at an interactive confirmation prompt (non-interactive runs abort).
-
-Nothing in this repo has been run against a live account.
-
-## Writing a strategy
-
-```python
-from bot.strategies.base import Bar, Signal, Strategy
-
-class MyStrategy(Strategy):
-    name = "my_strategy"
-    default_params = {"n": 20}
-
-    @property
-    def warmup(self) -> int:               # bars needed before the first signal
-        return self.params["n"]
-
-    def reset(self) -> None:               # clear state; called before every run
-        self.closes = []
-
-    def on_bar(self, bar: Bar) -> Signal | None:
-        self.closes.append(bar.close)      # you only ever see completed bars, in order
-        if len(self.closes) < self.params["n"]:
-            return None
-        return Signal(bar.symbol, target=1 if bar.close > min(self.closes[-self.params["n"]:]) else 0)
-
-    @classmethod
-    def param_grid(cls):                   # searched by walk-forward, on train data only
-        return [{"n": n} for n in (10, 20, 50)]
+```bash
+python -m bot doctor --live      # read-only
+python -m bot live check         # read-only: prints all gates
+python -m bot live arm / disarm
+python -m bot trade --live --strategy ma_crossover --symbol SPY --once
 ```
+Follow LIVE_RUNBOOK.md for the first controlled trade. Do not skip the paper phase.
 
-Register it in `bot/strategies/__init__.py`. Signals are desired exposure
-(+1/0/−1) and are filled at the *next* bar's open; the engine sizes them, attaches
-an ATR stop, and enforces the risk limits.
+## Risk limits and the kill switch
 
-## Limitations
+`RISK_PER_TRADE_PCT` (1%), `MAX_POSITION_PCT` (50%), `DAILY_LOSS_LIMIT_PCT` (3% → no new entries today),
+`MAX_DRAWDOWN_PCT` (20% from peak → liquidate everything, halt), `MAX_POSITIONS` (5), `ATR_STOP_MULT` (2.0), plus the
+dollar caps above in live safe mode. The same `RiskManager` runs in backtests and execution; nothing (strategy,
+advisor, operator flag) can bypass `check_order`. **When the kill switch trips:** you get a critical Discord alert
+(if configured), all positions are closed, every later cycle returns `status=killed`. Investigate the cause
+(`python -m bot review`, `logs/`), then — and only by a human — `python -m bot risk reset --run-id <paper|live>`.
 
-- Daily bars only. Intraday is intentionally not built yet.
-- Long/flat by default; `mean_reversion` can short with `allow_short=true`, and
-  the engine/loop handle short positions, but shorting was not evaluated.
-- Walk-forward folds reset positions and risk state at each boundary.
-- No dividends in `DATA_ADJUSTMENT=split` mode (use `all` for total-return prices).
-- The offline calendar fallback ignores exchange holidays; with Alpaca configured
-  the broker calendar is used.
+## Shutting everything down
+
+`Ctrl-C` the loop (it finishes the current cycle) · `python -m bot live disarm` · optionally close positions in
+the Alpaca dashboard (the bot reconciles and drops its local record) · set `LIVE_AUTONOMOUS_TRADING=false`.
+
+## Layout
+
+```
+bot/config.py           settings, separate paper/live credentials, safety flags
+bot/data/               Alpaca + CSV providers, DuckDB cache, calendar, quality checks
+bot/strategies/         Strategy interface, the two baselines, indicators
+bot/backtest/           engine (no lookahead), costs, metrics, walk-forward, reports
+bot/risk/               RiskLimits, SafeLiveLimits, RiskManager (stateful limits + check_order gate), sizing
+bot/execution/          broker (Alpaca / fake), Trader loop, interlock, MarketState, state store
+bot/monitoring/         JSON logging with redaction, decision records, dashboard, Discord alerts
+bot/research/           harness, surfaces, candidates, review, Kelly (research-only)     ← brain, cannot order
+bot/advisor/            shadow-mode advisor interface (rule baseline, Jev adapter)
+tests/                  126 offline tests; tests/integration/ real paper API (opt-in)
+AUDIT.md · REPORT.md · RESEARCH.md · STRATEGY_SPEC.md · DATA.md · ARCHITECTURE.md · LIVE_RUNBOOK.md · FINAL_REPORT.md
+```

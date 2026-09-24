@@ -1,5 +1,4 @@
 import pandas as pd
-import pytest
 
 from bot.backtest import Backtester, CostModel
 from bot.risk import RiskLimits, RiskManager, RiskState, fixed_fractional_qty

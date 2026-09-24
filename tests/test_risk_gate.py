@@ -1,5 +1,4 @@
 """Phase 13: deterministic pre-trade gate. Every check has a test that makes it fail alone."""
-import math
 from datetime import datetime
 
 import pytest

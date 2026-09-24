@@ -74,12 +74,10 @@ def _buy_and_hold(data: dict[str, pd.DataFrame], cut: Cut, costs: CostModel, cas
 
         @property
         def warmup(self): return 0
-        def reset(self): self.done = False
+        def reset(self): pass
         def on_bar(self, bar: Bar):
-            if not self.done:
-                self.done = True
-                return Signal(bar.symbol, 1, "buy and hold", stop_price=bar.close * 1e-6)
-            return None
+            # Re-emit every bar: warm-up bars are not tradeable and the engine ignores a redundant target.
+            return Signal(bar.symbol, 1, "buy and hold", stop_price=bar.close * 1e-6)
     n = len(data)
     risk = RiskLimits(risk_per_trade_pct=1.0, max_position_pct=1.0 / n, max_positions=n, daily_loss_limit_pct=1.0, max_drawdown_pct=1.0,
                       allow_fractional=True)

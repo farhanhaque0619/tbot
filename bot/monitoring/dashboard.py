@@ -38,7 +38,8 @@ def render(state_path: Path) -> Group:
     status = "🔴 KILLED" if risk.get("killed") else ("🟡 HALTED TODAY" if risk.get("halted_today") else "🟢 trading")
     head = Table.grid(padding=(0, 2))
     head.add_column(style="bold"); head.add_column()
-    head.add_row("Run", f"{state.run_id}  ·  {state.strategy} {state.params}  ·  {', '.join(state.symbols)}")
+    env_tag = "[bold red]LIVE — REAL MONEY[/bold red]" if state.env == "live" else f"[green]{(state.env or 'paper').upper()}[/green]"
+    head.add_row("Run", f"{env_tag}  ·  {state.run_id}  ·  {state.strategy} {state.params}  ·  {', '.join(state.symbols)}")
     head.add_row("Status", f"{status}" + (f"  ({risk.get('kill_reason')})" if risk.get("killed") else ""))
     head.add_row("Equity", f"{last_eq:,.2f}   peak {peak:,.2f}   drawdown {dd:.2%}   day start {risk.get('day_start_equity', 0):,.2f}")
     head.add_row("Last cycle", f"{state.last_cycle or '-'}" + (f"   [red]last error: {state.last_error}[/red]" if state.last_error else ""))

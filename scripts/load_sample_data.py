@@ -23,7 +23,6 @@ import subprocess
 import sys
 import tempfile
 import zipfile
-from datetime import date
 from pathlib import Path
 
 import pandas as pd

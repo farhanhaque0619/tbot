@@ -9,7 +9,7 @@ data. ``generate_signals`` is a convenience that replays a DataFrame through
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import pandas as pd

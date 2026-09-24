@@ -78,7 +78,7 @@ def test_submit_read_duplicate_cancel(broker, orders_enabled, cid):
         print(f"\norder {cid}: {f.status} filled={f.filled_qty} @ {f.filled_avg_price} req={broker.last_request_id}")
         if f.status == "filled":
             exit_cid = cid + "-exit"
-            ex = broker.submit_market_order(PROBE, f.filled_qty, "sell", exit_cid, "day")
+            broker.submit_market_order(PROBE, f.filled_qty, "sell", exit_cid, "day")
             fe = _wait(broker, exit_cid, {"filled", "canceled", "rejected"})
             assert fe.status == "filled", fe
     else:
