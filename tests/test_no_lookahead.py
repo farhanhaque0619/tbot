@@ -116,3 +116,77 @@ def test_walk_forward_selects_params_on_train_only():
         best = max(eligible, key=lambda pm: pm[1]["sharpe"])[0]
         assert f.best_params == best
         assert f.test_result.equity.index[0] >= f.test_start
+
+
+# ------------------------------------------------------------------ Phase 2 additions
+def test_multi_symbol_future_mutation_does_not_change_past():
+    from bot.strategies import MACrossover
+    data = {s: make_bars(400, seed=i) for i, s in enumerate(("A", "B", "C"))}
+    k = 250
+    rng = np.random.default_rng(5)
+    mutated = {}
+    for s, df in data.items():
+        m = df.copy()
+        f = np.exp(rng.normal(0, 0.1, len(df) - k)).cumprod()
+        for c in ("open", "high", "low", "close"):
+            m.iloc[k:, m.columns.get_loc(c)] *= f
+        m.iloc[k:, m.columns.get_loc("volume")] = 1.0
+        mutated[s] = m
+    a = Backtester(lambda: MACrossover(fast=5, slow=20), costs=NO_COST, risk=LOOSE_RISK, benchmark=True).run(data)
+    b = Backtester(lambda: MACrossover(fast=5, slow=20), costs=NO_COST, risk=LOOSE_RISK, benchmark=True).run(mutated)
+    pd.testing.assert_series_equal(a.equity.iloc[:k], b.equity.iloc[:k])
+    pd.testing.assert_series_equal(a.benchmark_equity.iloc[:k], b.benchmark_equity.iloc[:k])
+    cutoff = data["A"].index[k - 1]
+    assert [(t.symbol, t.entry_ts, t.qty) for t in a.trades if t.entry_ts <= cutoff] == \
+           [(t.symbol, t.entry_ts, t.qty) for t in b.trades if t.entry_ts <= cutoff]
+
+
+def test_trading_loop_decision_is_unchanged_by_future_bars(tmp_path):
+    """The loop's decision for session d must not depend on bars after d (appended or mutated)."""
+    from datetime import datetime
+    from bot.config import Settings
+    from bot.data.calendar import NY
+    from bot.data.loader import BarLoader
+    from bot.data.store import BarStore
+    from bot.execution import FakeBroker, StateStore, Trader
+    from bot.monitoring.decisions import DecisionLog
+    from bot.strategies import MACrossover
+
+    def run(extra_future: pd.DataFrame | None, tag: str):
+        df = make_bars(300, seed=9)
+        df.index = pd.bdate_range(end="2024-01-05", periods=300, tz=NY)
+        store = BarStore()
+        store.upsert_bars("SPY", df)
+        end = df.index[-1].date()
+        if extra_future is not None:
+            store.upsert_bars("SPY", extra_future)
+            end = extra_future.index[-1].date()
+        store.set_coverage("SPY", df.index[0].date(), end)
+        broker = FakeBroker(cash=100_000, prices={"SPY": float(df["close"].iloc[-1])})
+        t = Trader(settings=Settings(_env_file=None, allow_fractional=False), broker=broker, loader=BarLoader(store, None), bar_store=store,
+                   strategy_cls=MACrossover, params={"fast": 10, "slow": 50}, symbols=["SPY"],
+                   state_store=StateStore(tmp_path / f"{tag}.json"), decision_log=DecisionLog(tmp_path / f"{tag}.jsonl"))
+        t.run_cycle(datetime(2024, 1, 5, 19, 30, tzinfo=NY))            # decide for session 2024-01-05
+        rec = DecisionLog(tmp_path / f"{tag}.jsonl").read()[-1]
+        return rec["signal"], rec["desired_position"], rec["order_decision"], rec["market_state"]
+
+    base = run(None, "base")
+    fut_idx = pd.bdate_range("2024-01-08", periods=30, tz=NY)
+    crash = pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1e9}, index=fut_idx)
+    with_future = run(crash, "future")
+    assert base == with_future
+
+
+def test_market_state_uses_only_bars_up_to_decision(tmp_path):
+    from datetime import datetime
+    from bot.data.calendar import NY
+    from bot.execution.market_state import build_market_state
+    df = make_bars(300, seed=10)
+    df.index = pd.bdate_range(end="2024-01-05", periods=300, tz=NY)
+    now = datetime(2024, 1, 5, 19, 30, tzinfo=NY)
+    a = build_market_state(symbol="X", bars=df, now=now, market_open=False, quote=None, account=None, positions={}, open_orders=[])
+    fut = pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1e9},
+                       index=pd.bdate_range("2024-01-08", periods=30, tz=NY))
+    full = pd.concat([df, fut])
+    b = build_market_state(symbol="X", bars=full.loc[:now], now=now, market_open=False, quote=None, account=None, positions={}, open_orders=[])
+    assert a.to_dict() == b.to_dict()

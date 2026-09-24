@@ -271,6 +271,8 @@ class Backtester:
         if sig.target == cur:
             return
         if pos is not None:  # exit (also the first leg of a reversal; re-entry happens on a later signal)
+            if sym in pending and pending[sym].is_exit:
+                return  # a stop / kill exit is already queued for this bar; keep its reason
             pending[sym] = _Order(sym, -pos.side, pos.qty, sig.reason or "signal exit", ts, is_exit=True)
             return
         if sym in pending:  # an exit is already queued for this bar; don't stack orders
