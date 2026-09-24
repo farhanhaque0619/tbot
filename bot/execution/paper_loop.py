@@ -90,6 +90,13 @@ class Trader:
         self._stop = False
         self._asset_cache: dict[str, AssetInfo] = {}
         self._blocked_alerted: set[str] = set()
+        # Shadow-mode advisor (Phase 10): consumes MarketState, output is logged and NEVER used for decisions.
+        self.advisor = None
+        self.shadow = None
+        if getattr(settings, "enable_jev", False):
+            from bot.advisor import ShadowRecorder, build_advisor
+            self.advisor = build_advisor(settings)
+            self.shadow = ShadowRecorder(settings.log_dir / f"advisor_shadow_{run_id}.jsonl")
 
     # ------------------------------------------------------------------ loop
     def run_forever(self, poll_interval: int | None = None) -> None:
@@ -228,6 +235,13 @@ class Trader:
                                     positions=positions, open_orders=open_orders, peak_equity=self.risk.state.peak_equity,
                                     day_start_equity=self.risk.state.day_start_equity, fast=fast, slow=slow)
         rec.market_state = mstate.to_dict()
+        if self.advisor is not None:   # shadow only: record, never act
+            try:
+                advice = self.advisor.advise(mstate)
+                self.shadow.record(mstate, advice, desired, session_date.isoformat())
+                rec.notes.append(f"advisor(shadow) {advice.source}: {advice.regime}/{advice.direction}/q{advice.setup_quality}/{advice.risk_state}")
+            except Exception as e:  # noqa: BLE001
+                rec.notes.append(f"advisor error ignored: {type(e).__name__}")
         if math.isfinite(mstate.stale_data_seconds) and mstate.stale_data_seconds > self.settings.max_stale_data_seconds and clock_open:
             self.alerter.send(f"[{self.env.upper()}] stale market data for {sym}", f"{mstate.stale_data_seconds:.0f}s old", level="warning")
 

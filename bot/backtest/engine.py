@@ -90,6 +90,8 @@ class BacktestResult:
     costs_paid: float = 0.0
     exposure: float = 0.0
     notes: list[str] = field(default_factory=list)
+    gross_exposure: pd.Series | None = None
+    traded_notional: float = 0.0
 
     @property
     def daily_returns(self) -> pd.Series:
@@ -140,7 +142,8 @@ class Backtester:
         pending: dict[str, _Order] = {}
         last_close: dict[str, float] = {}
         trades: list[Trade] = []
-        equity_hist, cash_hist, ts_hist = [], [], []
+        equity_hist, cash_hist, ts_hist, gross_hist = [], [], [], []
+        traded_notional = 0.0
         risk_events: list[RiskEvent] = []
         n_orders, costs_paid, invested_days = 0, 0.0, 0
         killed_liquidating = False
@@ -161,6 +164,7 @@ class Backtester:
                 comm = self.costs.commission(order.qty)
                 n_orders += 1
                 costs_paid += abs(order.qty) * abs(fill - o) + comm
+                traded_notional += abs(order.qty) * fill
                 if order.is_exit:
                     p = positions.pop(sym)
                     proceeds = order.qty * fill * -order.side  # sell (+cash) or buy-to-cover (-cash)
@@ -195,6 +199,7 @@ class Backtester:
             equity_hist.append(equity)
             cash_hist.append(cash)
             ts_hist.append(ts)
+            gross_hist.append(sum(abs(p.qty) * last_close[p.symbol] for p in positions.values()))
             if trading_day:
                 for ev in risk.update_equity(ts, equity):
                     if ev.kind != "new_day":
@@ -235,12 +240,14 @@ class Backtester:
                 cash += p.side * p.qty * fill - comm  # sell a long / buy back a short
                 pnl = p.side * (fill - p.entry_price) * p.qty - p.entry_cost - comm
                 costs_paid += p.qty * abs(fill - last_close[sym]) + comm
+                traded_notional += p.qty * fill
                 n_orders += 1
                 trades.append(Trade(sym, p.side, p.qty, p.entry_ts, p.entry_price, last_ts, fill, pnl,
                                     pnl / (p.entry_price * p.qty), p.bars_held, p.entry_reason, "end of backtest"))
             positions.clear()
             equity_hist[-1] = cash
             cash_hist[-1] = cash
+            gross_hist[-1] = 0.0
         equity_s = pd.Series(equity_hist, index=pd.DatetimeIndex(ts_hist), name="equity")
         cash_s = pd.Series(cash_hist, index=equity_s.index, name="cash")
         # Only the trading window counts for metrics (warm-up bars are flat by construction).
@@ -253,9 +260,11 @@ class Backtester:
         metrics["orders"] = n_orders
         metrics["daily_halts"] = sum(1 for e in risk_events if e.kind == "daily_halt")
         metrics["kill_switch"] = bool(risk.killed)
+        gross_s = pd.Series(gross_hist, index=equity_s.index, name="gross")[window]
+        metrics["traded_notional"] = traded_notional
         result = BacktestResult(strategy_name, params, symbols, eq_w, cash_s[window], trades, metrics,
                                 risk_events=risk_events, killed=risk.killed, orders=n_orders,
-                                costs_paid=costs_paid, exposure=exposure)
+                                costs_paid=costs_paid, exposure=exposure, gross_exposure=gross_s, traded_notional=traded_notional)
         if risk.killed:
             result.notes.append(f"KILL SWITCH TRIPPED: {risk.state.kill_reason}. All positions liquidated; no trading afterwards.")
         if self.benchmark:
