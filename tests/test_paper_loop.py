@@ -122,7 +122,7 @@ def test_kill_switch_liquidates_and_blocks_trading(env):
 def test_waits_for_opg_window_when_market_closed(env):
     t = env["make"]()
     s = t.run_cycle(datetime(2024, 1, 5, 17, 0, tzinfo=NY))   # after close, before 19:00 -> OPG not accepted yet
-    assert s["status"] == "waiting_for_opg_window" and not env["broker"].submitted
+    assert s["status"] == "waiting_for_order_window" and not env["broker"].submitted
     s = t.run_cycle(FRI_EVENING)
     assert len(env["broker"].submitted) == 1 and env["broker"].submitted[0].client_order_id.endswith("entry")
 

@@ -88,11 +88,13 @@ def test_calendar_helpers():
     assert last_completed_session_date(datetime(2024, 1, 5, 16, 30, tzinfo=NY)) == date(2024, 1, 5)
 
 
-def test_live_trading_is_off_by_default_and_secrets_are_hidden():
+def test_paper_is_default_and_secrets_are_hidden():
     s = Settings(_env_file=None)
-    assert s.live_trading is False and s.paper is True
-    s = Settings(_env_file=None, alpaca_api_key="PKTESTKEY123", alpaca_secret_key="supersecretvalue")
+    assert s.trading_env == "paper" and not s.is_live and not s.live_autonomous_trading and s.safe_live_test_mode
+    assert not s.has_credentials("paper") and not s.has_credentials("live")
+    s = Settings(_env_file=None, alpaca_paper_api_key="PKTESTKEY123", alpaca_paper_secret_key="supersecretvalue")
     assert "PKTESTKEY123" not in repr(s) and "supersecretvalue" not in str(s)
+    assert s.credential_status("paper") == {"env": "paper", "key_present": True, "secret_present": True, "key_prefix_ok": True, "key_prefix": "PK"}
     f = RedactFilter(s.secret_values())
     rec = logging.LogRecord("x", logging.INFO, "", 0, "key=%s secret=%s", ("PKTESTKEY123", "supersecretvalue"), None)
     f.filter(rec)

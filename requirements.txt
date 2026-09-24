@@ -4,6 +4,6 @@ numpy==2.4.6
 duckdb==1.5.5
 pydantic==2.13.5
 pydantic-settings==2.15.0
-python-dotenv==1.1.1
+python-dotenv==1.2.2
 requests==2.34.2
 rich==14.1.0

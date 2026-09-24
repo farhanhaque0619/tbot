@@ -12,16 +12,21 @@ What is stored:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
 class BotState:
     run_id: str = "paper"
+    env: str = ""
     strategy: str = ""
     params: dict[str, Any] = field(default_factory=dict)
     symbols: list[str] = field(default_factory=list)
@@ -34,6 +39,7 @@ class BotState:
     equity_log: list[dict[str, Any]] = field(default_factory=list)
     last_cycle: str | None = None
     last_error: str | None = None
+    recovered_from_corruption: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -49,10 +55,25 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> BotState:
+        """Load state. A corrupt file is moved aside (never silently overwritten) and an empty state is returned;
+        the next cycle's broker reconciliation re-adopts real positions, and ``last_error`` records the incident."""
         if not self.path.exists():
             return BotState()
-        with self.path.open("r", encoding="utf-8") as f:
-            return BotState.from_dict(json.load(f))
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("state root is not an object")
+            return BotState.from_dict(data)
+        except (ValueError, TypeError) as e:
+            backup = self.path.with_name(f"{self.path.name}.corrupt-{int(time.time())}")
+            os.replace(self.path, backup)
+            log.error("state file %s is corrupt (%s); moved to %s and starting from an empty state. "
+                      "Broker positions will be re-adopted on the next cycle.", self.path, e, backup)
+            st = BotState()
+            st.last_error = f"state file corrupt: {e}; backup at {backup.name}"
+            st.recovered_from_corruption = True
+            return st
 
     def save(self, state: BotState) -> None:
         """Write to a temp file in the same directory, fsync, then atomically rename."""

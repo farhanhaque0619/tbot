@@ -30,16 +30,14 @@ class AlpacaBarProvider:
 
     name = "alpaca"
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, env: str = "paper"):
         from alpaca.data.historical import StockHistoricalDataClient
 
-        if not settings.has_alpaca_keys:
-            raise RuntimeError("ALPACA_API_KEY / ALPACA_SECRET_KEY are not set (see .env.example)")
+        key, secret = settings.credentials(env)   # market data works with either pair; paper keys are preferred
         self.settings = settings
-        self.client = StockHistoricalDataClient(
-            api_key=settings.alpaca_api_key.get_secret_value(),
-            secret_key=settings.alpaca_secret_key.get_secret_value(),
-        )
+        self.env = env
+        self.client = StockHistoricalDataClient(api_key=key, secret_key=secret)
+        del key, secret
 
     def fetch_daily(self, symbol: str, start: date, end: date) -> pd.DataFrame:
         from alpaca.common.exceptions import APIError
