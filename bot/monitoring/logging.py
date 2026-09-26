@@ -21,14 +21,22 @@ class RedactFilter(logging.Filter):
             text = text.replace(s, "***")
         return text
 
+    def _scrub_value(self, v):
+        """Redact inside strings only. Numbers, None, dates etc. keep their type so %d/%f formatting still works."""
+        return self._scrub(v) if isinstance(v, str) else v
+
     def filter(self, record: logging.LogRecord) -> bool:
         if self._secrets:
-            record.msg = self._scrub(str(record.msg))
+            if isinstance(record.msg, str):
+                record.msg = self._scrub(record.msg)
             if record.args:
                 if isinstance(record.args, dict):
-                    record.args = {k: self._scrub(str(v)) for k, v in record.args.items()}
+                    record.args = {k: self._scrub_value(v) for k, v in record.args.items()}
                 else:
-                    record.args = tuple(self._scrub(str(a)) for a in record.args)
+                    record.args = tuple(self._scrub_value(a) for a in record.args)
+            extra = getattr(record, "event", None)
+            if isinstance(extra, dict):
+                record.event = {k: self._scrub_value(v) for k, v in extra.items()}
         return True
 
 

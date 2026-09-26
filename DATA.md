@@ -45,6 +45,17 @@ fetched by this code yet. The first operator action is `python -m bot data fetch
   in `tests/test_no_lookahead.py` mutate every future bar and assert that earlier equity, trades, loop decisions,
   and market-state values are unchanged.
 
+## Why a request from 2015-01-01 returns history starting 2016-01-04
+
+Alpaca's historical stock data (bars, trades, quotes) starts on **2016-01-01**; 2016-01-04 is the first trading
+day of that year. The SDK cannot have truncated the request: `get_stock_bars` paginates automatically at 10,000
+bars per page and a 2015→2026 daily series is ~3,000 bars, a single page. Earlier history has to come from
+another source (`python -m bot data import` with a CSV) or the backtest start must be ≥ 2016 plus warm-up.
+
+The loader records coverage from the *requested* start so the empty range is not re-requested on every run, and
+logs a warning whenever the first returned bar is more than 10 days after the requested start (history floor,
+listing date, or a gap). `python -m bot data check` shows the actual first bar.
+
 ## Quality checks
 
 `python -m bot data check --symbol SPY` reports coverage, source, missing weekdays, duplicates, non-positive prices,

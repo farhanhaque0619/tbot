@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 
 OVERLAP_BARS = 5
 SPLIT_TOLERANCE = 0.005
+HISTORY_GAP_WARN_DAYS = 10   # first bar more than this after the requested start -> warn
 
 
 class BarLoader:
@@ -92,13 +93,19 @@ class BarLoader:
         log.info("fetching %s daily bars %s..%s from %s", symbol, start, end, self.provider.name)
         return self.provider.fetch_daily(symbol, start, end)
 
-    def _store(self, symbol: str, df: pd.DataFrame, start: date, end: date) -> None:
+    def _store(self, symbol: str, df: pd.DataFrame, start: date, end: date) -> int:
         assert self.provider is not None
-        n = self.store.upsert_bars(symbol, df, adjustment=self.adjustment, source=self.provider.name)
+        n = int(self.store.upsert_bars(symbol, df, adjustment=self.adjustment, source=self.provider.name))
         # Never mark coverage beyond the last bar we actually hold for the *future* edge.
         eff_end = min(end, date.today())
         self.store.set_coverage(symbol, start, eff_end, adjustment=self.adjustment)
         log.info("cached %d bars for %s (%s..%s)", n, symbol, start, eff_end)
+        if n and df.index[0].date() > start + timedelta(days=HISTORY_GAP_WARN_DAYS):
+            # e.g. Alpaca's stock history begins 2016-01-01; asking for 2015 legitimately returns from 2016-01-04.
+            log.warning("%s: requested history from %s but the first bar returned is %s; the source's history "
+                        "floor (Alpaca: 2016-01-01), a listing date, or a data gap. Coverage is recorded from %s so the "
+                        "missing range is not re-requested.", symbol, start, df.index[0].date(), start)
+        return n
 
     def _fetch_and_store(self, symbol: str, start: date, end: date) -> None:
         df = self._fetch(symbol, start, end)
