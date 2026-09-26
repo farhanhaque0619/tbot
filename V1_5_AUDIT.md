@@ -246,3 +246,11 @@ rows committed as `submitting` that never reached the broker.
 Baselines after Phase 5: `python -m bot backtest --strategy ma_crossover --symbol SP500 --start 2000-01-03 --end 2022-12-28 --no-save`
 re-run, +95.72%, Sharpe 0.51, 26 trades, walk-forward +53.00%, Sharpe 0.55, 56 trades (§2.3). `engine.py` and both
 baseline strategies unchanged; the minute engine's outputs are unchanged by the dispatch extraction (its tests are the check).
+
+## 10. Phase 6 record (paper start: documentation)
+
+README.md (V1.5 section, layout, test counts), ARCHITECTURE.md (V1.5 spine diagram and layering), DATA.md (streaming),
+STRATEGY_SPEC.md (Phase 3), LIVE_RUNBOOK.md (Phases 4–5), research/PROTOCOL.md, research/RESULTS_V1_5.md (generated,
+NOT EVALUATED), deploy/README.md, V1_5_FINAL_REPORT.md. No logic changed in this phase. Test count: 334 offline, 12
+integration. Baselines re-verified once more before the tag: +95.72%, Sharpe 0.51, 26 trades; walk-forward +53.00%,
+Sharpe 0.55, 56 trades.

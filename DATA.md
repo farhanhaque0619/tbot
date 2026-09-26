@@ -92,3 +92,12 @@ the data is close-only.
   `python -m bot universe build` from `config/tier3_candidates.txt` (a static large-cap candidate list, see D4 in
   V1_5_AUDIT.md) using 60-session median dollar volume, price ≥ $20, fractionable/tradable/easy-to-borrow flags and a
   sampled quoted spread ≤ 5 bps. `universe show` enforces the 30-symbol Basic-plan cap (`DATA_PLAN=plus` lifts it).
+
+- **Streaming (V1.5 Phase 5).** The daemon holds ONE websocket to `wss://stream.data.alpaca.markets/v2/{iex|sip}`
+  (feed from `DATA_PLAN`: `basic` → IEX live, `plus` → SIP), subscribes to bars for every symbol and quotes for
+  symbols with a position or open order (updated on position change), deduplicates by (symbol, bar start), drops
+  out-of-order bars with a log line, aggregates 30-minute bars on session boundaries, and after a reconnect backfills
+  the gap from REST (SIP for minutes older than 16 minutes, IEX for the rest) with those bars flagged `backfilled`.
+  A 406 error frame (connection limit) is fatal: the hub stops and alerts rather than fighting another process for the
+  connection. Freshness for intraday admission is measured from the last processed bar (`max_stale_seconds_intraday`,
+  90 s in the policies).

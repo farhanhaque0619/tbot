@@ -61,3 +61,45 @@ an order, touch the broker, modify code. Shadow mode is the only mode; there is 
 
 `python -m bot review` reads state and logs, writes `reports/review_*.md` with findings and PROPOSALS. It cannot
 write to state, `.env`, code, or the broker. Promotion of any proposal goes through RESEARCH.md's process rule.
+
+
+# V1.5 — the decision spine (Phases 2–5)
+
+```
+   market data (one WS)          trade updates (WS)            scheduler (close-relative marks)
+   bot/stream/marketdata.py      bot/stream/tradeupdates.py    bot/runtime/scheduler.py
+   dedup · order · 30m agg ·     host-verified · watermark ·   pre_open 09:00/09:29 · open · t1530 ·
+   406 fatal · gap backfill      reconnect → reconcile         t1550 · t1558 · close · 16:30 · 19:05
+            │ BarEvent/QuoteEvent          │ TradeUpdateEvent              │ ScheduleEvent
+            └──────────────────────────────┴────────── EventBus ──────────┘
+                                                   │
+   ┌───────────────────────────────────────────────▼──────────────────────────────────────────────┐
+   │  DAEMON  bot/runtime/daemon.py  (the same step the backtester runs: bot/portfolio/dispatch.py) │
+   │  FeatureEngine.snapshot ──► modules (M1/M2/M3, own slice only) ──► TradeIntents              │
+   │        ──► RiskEngine.admit ──► Allocator (caps scale DOWN only) ──► TargetPositions          │
+   │        ──► OrderManager.reconcile: exits before entries · RiskManager.check_order on EVERY    │
+   │            order incl. protective legs · store row committed BEFORE the broker call ·         │
+   │            deterministic client id · OTO / GTC / DAY protection policy                        │
+   │  trade updates ──► OrderManager.on_trade_update (idempotent) ──► ExposureLedger slices        │
+   │  every 5 min ──► reconcile (broker is the authority) · every bar ──► kill switch on equity    │
+   └───────────────────────────────────────────────┬──────────────────────────────────────────────┘
+                                                   │ SQLite WAL  state/<env>.sqlite
+   ┌───────────────────────────────────────────────▼──────────────────────────────────────────────┐
+   │  WATCHDOG  bot/runtime/watchdog.py  (own process; reads the store and the broker)              │
+   │  heartbeat · feed · trade updates · broker · positions · loss/drawdown · orphans · protection │
+   │  alert → halt flag → cancel pending entries → flatten (only as config/watchdog.yaml allows)  │
+   └──────────────────────────────────────────────────────────────────────────────────────────────┘
+
+   RESEARCH (brain)  bot/research/protocol.py: cuts A/B/C, sealed D, trial registry, deflated Sharpe, stresses,
+   causal regimes, pass/fail → research/RESULTS_V1_5.md → research/PROMOTIONS.md → RiskPolicy.load(require_promotions)
+```
+
+Layering, enforced by `tests/test_architecture.py`: `bot.core` and `bot.risk` import nothing above them;
+`bot.strategies`, `bot.portfolio`, `bot.features`, `bot.advisor` cannot reach order submission; `bot.stream` cannot
+import `bot.execution`; the watchdog cannot import strategies, the allocator, the OMS or features; nothing in `bot/`
+mutates a `RiskPolicy` (frozen, fingerprinted; the arm flow and the daemon compare fingerprints); the live policy is
+stricter than the paper policy on every limit that matters.
+
+Two execution paths coexist and never share a process: V1 (`python -m bot trade`, daily bars, the two baselines,
+JSON state) and V1.5 (`python -m bot run`, minute bars, modules, SQLite). `python -m bot state migrate` moves the V1
+state into the store once.

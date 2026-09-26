@@ -1,4 +1,4 @@
-# tbot — research-grade trading bot: backtests, Alpaca paper trading, gated live execution
+# tbot — research-grade trading bot: backtests, Alpaca paper trading, gated live execution (V1.5)
 
 > **PAPER IS DEFAULT. LIVE TRADING USES REAL MONEY. BACKTEST PERFORMANCE DOES NOT GUARANTEE FUTURE PERFORMANCE.**
 
@@ -53,7 +53,7 @@ alpha; any evidence that the 2×ATR stop is the right stop (it produces most exi
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env            # edit with an editor; never echo keys into a terminal
-python -m pytest -q             # 126 offline tests, ~1 min; 7 integration tests skip without credentials
+python -m pytest -q             # 334 offline tests, a few minutes; 12 integration tests skip without credentials
 ```
 
 Paper keys: Alpaca dashboard → *Paper Trading* → *API Keys* → into `ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_SECRET_KEY`
@@ -124,6 +124,39 @@ advisor, operator flag) can bypass `check_order`. **When the kill switch trips:*
 `Ctrl-C` the loop (it finishes the current cycle) · `python -m bot live disarm` · optionally close positions in
 the Alpaca dashboard (the bot reconciles and drops its local record) · set `LIVE_AUTONOMOUS_TRADING=false`.
 
+## V1.5: minute-bar modules, autonomous daemon, research protocol
+
+V1.5 adds a second execution path beside the V1 loop (which is unchanged and still runs the two baselines):
+
+- **Modules** (`bot/strategies/v15/`): M1 vol-managed index trend (SPY/QQQ, daily close, target weights), M2 market
+  intraday momentum (SPY/QQQ, 15:30 entry, flat by the close), M3 large-cap residual reversal (Tier 3, paper-only).
+  They emit *opinions* (`TradeIntent`); the `Allocator` sizes and only ever scales down; the `RiskEngine` (wrapping the
+  unchanged `RiskManager`) admits and gates every order; the `OrderManager` places orders with broker-side protection.
+  All of this is deterministic; no model is in the loop.
+- **Policy** (`config/policy.paper.yaml`, `config/policy.live.yaml`): frozen, fingerprinted, operator-owned. The live
+  policy is refused unless every module in it has a promotion record in `research/PROMOTIONS.md` — none has, so live
+  arming refuses today by design.
+- **Backtester** (`bot/backtest/engine_v15.py`): minute bars, auctions, stops across gaps, partial fills, stress hooks,
+  the same decision step as the daemon; in daily-legacy mode it reproduces the V1 engine exactly (the frozen numbers
+  in V1_5_AUDIT.md §2 are the oracle and are re-verified in every phase commit).
+- **Research protocol** (`python -m bot research run|report|trials`, research/PROTOCOL.md): cuts A/B/C and the sealed
+  holdout D, a trial registry that deflates Sharpe ratios, cost stresses, causal regimes, fixed pass/fail criteria.
+  `research/RESULTS_V1_5.md` currently says NOT EVALUATED for all three modules: this repository was built where no
+  SPY/QQQ, minute or Tier 3 data could be fetched. Nothing in V1.5 claims an edge.
+- **Runtime**: `python -m bot run --env paper` (daemon), `python -m bot watchdog` (independent process),
+  `python -m bot gates` (paper→live gates, read-only), `python -m bot state migrate` (V1 JSON → SQLite),
+  `python -m bot risk unthrottle --module M2`. deploy/README.md covers the VPS setup.
+
+```bash
+python -m bot data fetch --symbol SPY --symbol QQQ --start 2014-01-01 --end 2026-09-26      # daily warm-up for M1
+python -m bot data fetch --timeframe 1m --symbol SPY --symbol QQQ --start 2019-01-01 --end 2023-12-31 --feed sip
+python -m bot research report                       # writes research/RESULTS_V1_5.md (NOT EVALUATED until data exists)
+python -m bot run --env paper --once                # boot, reconcile, one cycle, persist, exit
+python -m bot run --env paper                       # the daemon (or the systemd unit)
+python -m bot watchdog --once                       # what the watchdog would do right now
+python -m bot gates                                 # paper -> live candidate gates
+```
+
 ## Layout
 
 ```
@@ -136,6 +169,17 @@ bot/execution/          broker (Alpaca / fake), Trader loop, interlock, MarketSt
 bot/monitoring/         JSON logging with redaction, decision records, dashboard, Discord alerts
 bot/research/           harness, surfaces, candidates, review, Kelly (research-only)     ← brain, cannot order
 bot/advisor/            shadow-mode advisor interface (rule baseline, Jev adapter)
-tests/                  126 offline tests; tests/integration/ real paper API (opt-in)
+bot/core/               V1.5 events, intents, frozen RiskPolicy (fingerprinted), event bus
+bot/portfolio/          Allocator (caps scale down only), the shared decision step (dispatch)
+bot/features/           incremental FeatureEngine (1m / 30m / 1d)
+bot/strategies/v15/     M1 vol-managed trend, M2 intraday momentum, M3 residual reversal (research candidates)
+bot/stream/             market-data hub (one connection) and trade-updates client
+bot/runtime/            scheduler, autonomous daemon, watchdog
+bot/execution/          + constraints, OrderManager (OMS), SQLite ExecutionStore, reconcile, gates, interlock
+bot/research/protocol.py  cuts A–D (D sealed), trial registry, deflated Sharpe, stresses, causal regimes
+config/                 policy.paper.yaml · policy.live.yaml · universe.yaml · watchdog.yaml · earnings.csv
+deploy/                 systemd units and the VPS runbook
+tests/                  334 offline tests (tests/v15/ for V1.5); tests/integration/ real paper API (opt-in, 12)
 AUDIT.md · REPORT.md · RESEARCH.md · STRATEGY_SPEC.md · DATA.md · ARCHITECTURE.md · LIVE_RUNBOOK.md · FINAL_REPORT.md
+V1_5_AUDIT.md · V1_5_FINAL_REPORT.md · research/PROTOCOL.md · research/RESULTS_V1_5.md · research/PROMOTIONS.md
 ```
