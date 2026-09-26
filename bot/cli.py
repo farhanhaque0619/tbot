@@ -492,8 +492,48 @@ def cmd_risk(args) -> int:
     return 0
 
 
+def _calendar(settings: Settings, store, broker=None):
+    from bot.data.sessions import SessionCalendar
+    cal = SessionCalendar.from_store(store)
+    if broker is not None:
+        try:
+            cal.sync_from_broker(broker, store, date.today() - timedelta(days=400), date.today() + timedelta(days=60))
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[yellow]calendar sync failed ({type(e).__name__}); using cached/rule calendar[/yellow]")
+    return cal
+
+
 def cmd_data(args) -> int:
     settings = get_settings()
+    if args.data_cmd == "fetch" and getattr(args, "timeframe", "1d") == "1m":
+        from bot.data.minute import fetch_minute_history
+        from bot.data.providers import AlpacaBarProvider, DataPlanError
+
+        env: TradingEnv = "paper" if settings.has_credentials("paper") else "live"
+        if not settings.has_credentials(env):
+            raise SystemExit("No Alpaca credentials configured.")
+        store, _ = _make_loader(settings)
+        provider = AlpacaBarProvider(settings, env=env)
+        feed = args.feed or settings.data_feed
+        cal = _calendar(settings, store, _broker(settings, env) if settings.has_credentials(env) else None)
+        for sym in args.symbol:
+            try:
+                summ = fetch_minute_history(store, provider, sym, args.start, args.end, feed=feed, calendar=cal, force=args.refresh)
+            except DataPlanError as e:
+                raise SystemExit(f"DATA PLAN: {e}") from e
+            console.print(f"{sym.upper()} 1m/{feed}: {summ.sessions_fetched}/{summ.sessions_requested} sessions fetched, {summ.bars_written} bars written, "
+                          f"incomplete sessions: {len(summ.incomplete)} {[str(d) for d in summ.incomplete[:5]]}")
+        return 0
+    if args.data_cmd == "check" and getattr(args, "timeframe", "1d") == "1m":
+        from bot.data.quality import check_minute_frame
+        from bot.data.store import BarStore
+
+        store = BarStore(settings.data_db_path)
+        cal = _calendar(settings, store)
+        for sym in args.symbol:
+            df = store.get_minute_bars(sym, feed=args.feed)
+            console.print(check_minute_frame(sym, df, cal, feed=args.feed or "any").render())
+        return 0
     if args.data_cmd == "fetch":
         _, loader = _make_loader(settings, need_provider=True)
         for sym in args.symbol:
@@ -526,6 +566,51 @@ def cmd_data(args) -> int:
             rep = check_symbol(store, sym, adjustment=settings.data_adjustment)
             console.print(rep.render())
     return 0
+
+
+def cmd_universe(args) -> int:
+    from bot.data.universe import Universe, build_tier3, read_candidates
+
+    settings = get_settings()
+    u = Universe.load(settings.universe_path)
+    if args.universe_cmd == "show":
+        console.print(f"tier1 {u.tier1}\ntier2 {u.tier2}\ntier3 {u.tier3} (built_on={u.tier3_built_on})\n"
+                      f"total {len(u.symbols)} / cap {u.plan_cap} (DATA_PLAN={settings.data_plan})")
+        try:
+            u.check_cap(settings.data_plan)
+            console.print("[green]within the streaming cap[/green]")
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            return 1
+        return 0
+    if args.universe_cmd == "build":
+        env: TradingEnv = "paper"
+        broker = _broker(settings, env)
+        store, loader = _make_loader(settings, env, need_provider=True)
+        asof = args.asof or date.today()
+
+        def spread_samples(sym: str) -> list[float]:
+            # Sampled quoted spread: one latest quote now (Basic plan has no cheap 60-day quote history). Documented in D4.
+            q = broker.get_latest_quote(sym)
+            return [q.spread_bps] if q else []
+        selected, evaluated = build_tier3(read_candidates(args.candidates), daily_bars=lambda s, a, b: loader.get_daily(s, a, b),
+                                          asset_info=broker.get_asset, spread_samples=spread_samples, asof=asof, n=args.n)
+        t = Table(title=f"tier 3 candidates as of {asof}", header_style="bold")
+        for c in ("Symbol", "Price", "Median $vol (M)", "Spread bps", "Eligible", "Reasons"):
+            t.add_column(c)
+        for c in sorted(evaluated, key=lambda c: -c.median_dollar_volume):
+            t.add_row(c.symbol, f"{c.price:.2f}", f"{c.median_dollar_volume / 1e6:,.0f}", f"{c.median_spread_bps:.1f}" if c.median_spread_bps != float("inf") else "-",
+                      "yes" if c.eligible else "no", "; ".join(c.reasons))
+        console.print(t)
+        u.tier3 = [c.symbol for c in selected]
+        u.tier3_built_on = asof.isoformat()
+        for c in selected:
+            u.sectors[c.symbol] = c.sector
+        u.check_cap(settings.data_plan)
+        p = u.save()
+        console.print(f"wrote {p} with {len(u.tier3)} tier-3 symbols; review and commit it")
+        return 0
+    return 1
 
 
 def cmd_review(args) -> int:
@@ -625,10 +710,19 @@ def build_parser() -> argparse.ArgumentParser:
     dd = sub.add_parser("data", help="manage the local bar cache")
     ds = dd.add_subparsers(dest="data_cmd", required=True)
     f = ds.add_parser("fetch"); f.add_argument("--symbol", required=True, action="append"); f.add_argument("--start", required=True, type=_date); f.add_argument("--end", required=True, type=_date); f.add_argument("--refresh", action="store_true")
+    f.add_argument("--timeframe", choices=["1d", "1m"], default="1d"); f.add_argument("--feed", choices=["sip", "iex"], default=None)
     i = ds.add_parser("import"); i.add_argument("--symbol", required=True); i.add_argument("--csv", required=True); i.add_argument("--close-column", default=None, help="for wide close-only files: which column is this symbol")
     ds.add_parser("list")
     c = ds.add_parser("check", help="data-quality report: gaps, holidays, splits, duplicates"); c.add_argument("--symbol", required=True, action="append")
+    c.add_argument("--timeframe", choices=["1d", "1m"], default="1d"); c.add_argument("--feed", choices=["sip", "iex"], default=None)
     dd.set_defaults(fn=cmd_data)
+
+    un = sub.add_parser("universe", help="show or build the trading universe (config/universe.yaml)")
+    un.add_argument("universe_cmd", choices=["show", "build"])
+    un.add_argument("--candidates", default="config/tier3_candidates.txt")
+    un.add_argument("--n", type=int, default=15)
+    un.add_argument("--asof", type=_date, default=None)
+    un.set_defaults(fn=cmd_universe)
 
     rv = sub.add_parser("review", help="post-session review report (read-only; proposes, never deploys)")
     rv.add_argument("--run-id", default="paper")

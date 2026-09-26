@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     data_feed: Literal["sip", "iex"] = "sip"
     data_adjustment: Literal["raw", "split", "dividend", "all"] = "split"
     data_db_path: Path = Path("data_cache/bars.duckdb")
+    data_plan: Literal["basic", "plus"] = "basic"     # basic: 1 WS connection, 30 symbols, SIP lagged 15 min
+    universe_path: Path = Path("config/universe.yaml")
     max_stale_data_seconds: int = Field(default=900, ge=0)   # freshness threshold for quotes/account snapshots
 
     # --- Risk (shared by backtest and execution) ----------------------------------------------

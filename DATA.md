@@ -61,3 +61,34 @@ listing date, or a gap). `python -m bot data check` shows the actual first bar.
 `python -m bot data check --symbol SPY` reports coverage, source, missing weekdays, duplicates, non-positive prices,
 OHLC consistency, one-day moves above 40% (possible unadjusted split or bad print), zero-volume share, and whether
 the data is close-only.
+
+## Minute bars (V1.5 Phase 1)
+
+- **Tables.** `bars_1m(symbol, ts, o, h, l, c, v, trade_count, vwap, feed, backfilled, fetched_at)` keyed by
+  (symbol, feed, ts) with `ts` = bar START in naive UTC; `quotes(symbol, ts, bid, ask, bid_size, ask_size, feed)`;
+  `minute_coverage(symbol, feed, session_date, bars, complete)`; `sessions(session_date, open_ts, close_ts, source)`.
+  `bars_1d` is a view over the existing daily `bars` table.
+- **Feeds and lag.** `DATA_FEED=sip` is the consolidated tape. On the Basic plan SIP data younger than 15 minutes is
+  refused, so `fetch_minute` never requests past now − 16 min for SIP (`sip_lagged_end`), and IEX is requested with
+  no lag. A subscription refusal is raised as `DataPlanError`; there is deliberately no silent fallback to IEX for
+  a query that asked for SIP, because IEX volume is a small fraction of the tape and IEX prices can differ by a tick.
+- **Fetch.** `python -m bot data fetch --timeframe 1m --symbol SPY --start 2016-01-04 --end 2026-09-26 --feed sip`
+  fetches session by session in chunks and is resumable: a session is marked complete in `minute_coverage` when it
+  holds ≥ 98% of the expected minutes and its close is at least 16 minutes old (SIP); incomplete sessions are
+  re-requested on the next run. Roughly 2.6 million bars per symbol for 2016–2026; ~260 requests of 10,000 bars.
+- **Sessions.** `bot/data/sessions.py` combines the broker calendar (synced into the `sessions` table, authoritative)
+  with exact NYSE rules as the offline fallback: holidays with Saturday→Friday / Sunday→Monday observance (except
+  New Year's Day on a Saturday), Good Friday via the Gregorian Easter algorithm, Juneteenth from 2022, 13:00 early
+  closes (day after Thanksgiving; July 3 and December 24 when they fall Monday–Thursday), and the known special
+  closures (2018-12-05, 2025-01-09). Cutoffs: OPG 09:28, CLS 15:50 (12:50 on an early close).
+- **Aggregation.** `aggregate(bars_1m, minutes, calendar)` buckets on exact ET boundaries from each session's open,
+  drops bars outside regular hours and on non-session dates, and flags the last bar of a session `is_session_end` and
+  `partial` when the session closes before the bar's natural end. Timestamps stay correct across DST changes because
+  bucketing happens in New York time.
+- **Quality.** `python -m bot data check --timeframe 1m --symbol SPY` reports missing minutes per session (2%
+  tolerance), duplicates, OHLC consistency, bars outside the session, zero-volume runs ≥ 5 minutes, session-to-session
+  jumps > 20% (unadjusted splits), and the share of backfilled bars.
+- **Universe.** `config/universe.yaml`: Tier 1 SPY QQQ IWM DIA, Tier 2 the eleven sector ETFs, Tier 3 written by
+  `python -m bot universe build` from `config/tier3_candidates.txt` (a static large-cap candidate list, see D4 in
+  V1_5_AUDIT.md) using 60-session median dollar volume, price ≥ $20, fractionable/tradable/easy-to-borrow flags and a
+  sampled quoted spread ≤ 5 bps. `universe show` enforces the 30-symbol Basic-plan cap (`DATA_PLAN=plus` lifts it).

@@ -38,6 +38,24 @@ CREATE TABLE IF NOT EXISTS coverage (
     start_date DATE, end_date DATE, updated_at TIMESTAMP,
     PRIMARY KEY (symbol, timeframe, adjustment)
 );
+CREATE TABLE IF NOT EXISTS bars_1m (
+    symbol VARCHAR NOT NULL, ts TIMESTAMP NOT NULL,   -- bar START, UTC naive
+    open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume DOUBLE, trade_count DOUBLE, vwap DOUBLE,
+    feed VARCHAR NOT NULL, backfilled BOOLEAN DEFAULT FALSE, fetched_at TIMESTAMP,
+    PRIMARY KEY (symbol, feed, ts)
+);
+CREATE TABLE IF NOT EXISTS minute_coverage (
+    symbol VARCHAR NOT NULL, feed VARCHAR NOT NULL, session_date DATE NOT NULL, bars INTEGER, complete BOOLEAN, fetched_at TIMESTAMP,
+    PRIMARY KEY (symbol, feed, session_date)
+);
+CREATE TABLE IF NOT EXISTS quotes (
+    symbol VARCHAR NOT NULL, ts TIMESTAMP NOT NULL, bid DOUBLE, ask DOUBLE, bid_size DOUBLE, ask_size DOUBLE, feed VARCHAR NOT NULL,
+    PRIMARY KEY (symbol, feed, ts)
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    session_date DATE PRIMARY KEY, open_ts TIMESTAMP, close_ts TIMESTAMP, source VARCHAR
+);
+CREATE VIEW IF NOT EXISTS bars_1d AS SELECT * FROM bars;
 CREATE TABLE IF NOT EXISTS equity_history (
     run_id VARCHAR NOT NULL, ts TIMESTAMP NOT NULL, equity DOUBLE, cash DOUBLE,
     PRIMARY KEY (run_id, ts)
@@ -139,6 +157,97 @@ class BarStore:
             "SELECT symbol, timeframe, adjustment, count(*) AS bars, min(ts) AS first_ts, max(ts) AS last_ts, "
             "any_value(source) AS source FROM bars GROUP BY 1,2,3 ORDER BY 1,2,3"
         ).df()
+
+    # ------------------------------------------------------------ minute bars
+    def upsert_minute_bars(self, symbol: str, df: pd.DataFrame, *, feed: str, backfilled: bool = False) -> int:
+        """``df`` indexed by tz-aware bar-start timestamps; columns open/high/low/close/volume(+trade_count, vwap)."""
+        if df.empty:
+            return 0
+        out = df.copy()
+        idx = pd.DatetimeIndex(out.index)
+        if idx.tz is None:
+            raise ValueError("minute bar index must be tz-aware")
+        out.index = idx.tz_convert("UTC").tz_localize(None)
+        for c in OPTIONAL_COLUMNS:
+            if c not in out.columns:
+                out[c] = float("nan")
+        out = out[BAR_COLUMNS + OPTIONAL_COLUMNS].astype(float)
+        out = out.reset_index().rename(columns={out.index.name or "index": "ts"})
+        out.insert(0, "symbol", symbol.upper())
+        out["feed"] = feed
+        out["backfilled"] = bool(backfilled)
+        out["fetched_at"] = pd.Timestamp.utcnow().tz_localize(None)
+        self.con.register("_new_1m", out)
+        self.con.execute("INSERT OR REPLACE INTO bars_1m SELECT symbol, ts, open, high, low, close, volume, trade_count, vwap, feed, backfilled, fetched_at FROM _new_1m")
+        self.con.unregister("_new_1m")
+        return int(len(out))
+
+    def get_minute_bars(self, symbol: str, start=None, end=None, *, feed: str | None = None) -> pd.DataFrame:
+        q = "SELECT ts, open, high, low, close, volume, trade_count, vwap, feed, backfilled FROM bars_1m WHERE symbol=?"
+        params: list = [symbol.upper()]
+        if feed:
+            q += " AND feed=?"
+            params.append(feed)
+        if start is not None:
+            t = pd.Timestamp(start)
+            t = t.tz_localize("America/New_York") if t.tzinfo is None else t
+            q += " AND ts >= ?"
+            params.append(t.tz_convert("UTC").tz_localize(None))
+        if end is not None:
+            t = pd.Timestamp(end)
+            t = t.tz_localize("America/New_York") if t.tzinfo is None else t
+            q += " AND ts < ?"
+            params.append(t.tz_convert("UTC").tz_localize(None))
+        q += " ORDER BY ts"
+        df = self.con.execute(q, params).df()
+        if df.empty:
+            return pd.DataFrame(columns=BAR_COLUMNS + OPTIONAL_COLUMNS + ["feed", "backfilled"], index=pd.DatetimeIndex([], tz="America/New_York", name="ts"))
+        df["ts"] = to_ny_index(pd.DatetimeIndex(df["ts"]))
+        return df.set_index("ts")
+
+    def set_minute_coverage(self, symbol: str, feed: str, session_date: date, bars: int, complete: bool) -> None:
+        self.con.execute("INSERT OR REPLACE INTO minute_coverage VALUES (?, ?, ?, ?, ?, now())", [symbol.upper(), feed, session_date, int(bars), bool(complete)])
+
+    def minute_coverage(self, symbol: str, feed: str) -> dict[date, tuple[int, bool]]:
+        rows = self.con.execute("SELECT session_date, bars, complete FROM minute_coverage WHERE symbol=? AND feed=?", [symbol.upper(), feed]).fetchall()
+        return {r[0]: (int(r[1]), bool(r[2])) for r in rows}
+
+    def upsert_quotes(self, symbol: str, df: pd.DataFrame, *, feed: str) -> int:
+        if df.empty:
+            return 0
+        out = df.copy()
+        idx = pd.DatetimeIndex(out.index)
+        if idx.tz is None:
+            raise ValueError("quote index must be tz-aware")
+        out.index = idx.tz_convert("UTC").tz_localize(None)
+        for c in ("bid_size", "ask_size"):
+            if c not in out.columns:
+                out[c] = float("nan")
+        out = out[["bid", "ask", "bid_size", "ask_size"]].astype(float).reset_index().rename(columns={out.index.name or "index": "ts"})
+        out.insert(0, "symbol", symbol.upper())
+        out["feed"] = feed
+        self.con.register("_new_q", out)
+        self.con.execute("INSERT OR REPLACE INTO quotes SELECT symbol, ts, bid, ask, bid_size, ask_size, feed FROM _new_q")
+        self.con.unregister("_new_q")
+        return int(len(out))
+
+    def get_quotes(self, symbol: str, start=None, end=None, *, feed: str | None = None) -> pd.DataFrame:
+        q = "SELECT ts, bid, ask, bid_size, ask_size, feed FROM quotes WHERE symbol=?"
+        params: list = [symbol.upper()]
+        if feed:
+            q += " AND feed=?"; params.append(feed)
+        for op, v in ((">=", start), ("<", end)):
+            if v is not None:
+                t = pd.Timestamp(v)
+                t = t.tz_localize("America/New_York") if t.tzinfo is None else t
+                q += f" AND ts {op} ?"
+                params.append(t.tz_convert("UTC").tz_localize(None))
+        q += " ORDER BY ts"
+        df = self.con.execute(q, params).df()
+        if df.empty:
+            return pd.DataFrame(columns=["bid", "ask", "bid_size", "ask_size", "feed"], index=pd.DatetimeIndex([], tz="America/New_York", name="ts"))
+        df["ts"] = to_ny_index(pd.DatetimeIndex(df["ts"]))
+        return df.set_index("ts")
 
     # ---------------------------------------------------------- equity curve
     def append_equity(self, run_id: str, ts, equity: float, cash: float) -> None:

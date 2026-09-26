@@ -1,0 +1,29 @@
+# Trading universe (Phase 1). Basic data plan: at most 30 streamed symbols in total.
+# Tier 3 is written by `python -m bot universe build` and committed by the operator.
+plan_cap: 30
+tiers:
+  tier1:
+    symbols: [SPY, QQQ, IWM, DIA]
+    sector: index
+  tier2:
+    symbols: [XLK, XLF, XLE, XLV, XLY, XLP, XLI, XLU, XLB, XLRE, XLC]
+    sector: sector_etf
+  tier3:
+    built_on: null
+    symbols: []
+sectors:
+  SPY: index
+  QQQ: index
+  IWM: index
+  DIA: index
+  XLK: technology
+  XLF: financials
+  XLE: energy
+  XLV: healthcare
+  XLY: consumer_discretionary
+  XLP: consumer_staples
+  XLI: industrials
+  XLU: utilities
+  XLB: materials
+  XLRE: real_estate
+  XLC: communication
