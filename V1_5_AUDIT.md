@@ -58,16 +58,43 @@ Walk-forward folds (train 3y / test 1y, selected by train Sharpe, min 5 trades):
 Data: `SPY` and `QQQ` 2,698 bars each, 2016-01-04 → 2026-09-25, `source=alpaca`, split-adjusted, 102 missing weekdays
 (holidays), 0 duplicates, 0 OHLC inconsistencies, `data check` OK for both. `doctor --paper` OK, exit 0.
 
-### 2.2 Not yet frozen (the build environment has no route to Alpaca; the operator must run these once and paste the output)
+### 2.2 Frozen by the operator on real Alpaca data (2026-09-26 17:06 ET, same settings as 2.1)
 
-```
-python -m bot backtest --strategy mean_reversion --symbol SPY --start 2017-01-03 --end 2026-09-26
-python -m bot backtest --strategy ma_crossover --symbol QQQ --start 2017-01-03 --end 2026-09-26
-python -m bot backtest --strategy mean_reversion --symbol QQQ --start 2017-01-03 --end 2026-09-26
-python -m bot research compare --symbol SPY --start 2017-01-03 --end 2026-09-26
-```
-Until pasted, the reproduction tests for Phase 2 use the offline proxy numbers in REPORT.md/RESEARCH.md (SP500 close-only,
-GOOG OHLCV), which are in this repository's cache and are byte-reproducible here.
+| Run (2017-01-03 → 2026-09-25) | Total | CAGR | Sharpe | MaxDD | Trades | Win | PF | Time in mkt | Costs | B&H total / Sharpe |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mean_reversion SPY, full | +8.16% | +0.81% | 0.30 | −8.05% | 57 | 68.42% | 1.44 | 11.28% | 1,296.49 | +242.61% / 0.80 |
+| mean_reversion SPY, walk-forward OOS 2020-01-03→2026-09-25 | −4.44% | −0.67% | −0.27 | −8.65% | 25 | 44.00% | 0.69 | 7.98% | – | +139.66% / 0.76 |
+| ma_crossover QQQ, full | +48.24% | +4.13% | 0.73 | −10.20% | 6 | 66.67% | 22.98 | 63.61% | 132.15 | +522.80% / 0.94 |
+| ma_crossover QQQ, walk-forward OOS | +26.06% | +3.50% | 0.91 | −5.78% | 16 | 68.75% | 6.07 | 53.93% | – | +246.88% / 0.87 |
+| mean_reversion QQQ, full | −7.48% | −0.80% | −0.28 | −10.56% | 45 | 48.89% | 0.68 | 10.75% | 719.45 | +522.80% / 0.94 |
+| mean_reversion QQQ, walk-forward OOS | −2.77% | −0.42% | −0.12 | −9.78% | 41 | 58.54% | 0.85 | 17.21% | – | +246.88% / 0.87 |
+
+Walk-forward parameter choices (train Sharpe → test Sharpe, trades): mean_reversion SPY 40/2.0/0.0 (0.93→−1.38, 5),
+40/1.5/0.0 (0.22→0.44, 1), 10/2.0/0.5 (0.44→−1.48, 5), 20/2.5/0.5 (0.44→−1.13, 1), 20/2.0/0.5 (0.85→2.44, 5),
+20/2.0/0.5 (1.16→−0.71, 6), 40/2.0/0.0 (1.03→0.62, 2). ma_crossover QQQ 10/50 (0.71→1.53, 3), 10/100 (0.73→1.16, 2),
+10/100 (0.95→−1.06, 2), 10/100 (0.71→1.88, 2), 10/100 (0.78→0.50, 4), 50/100 (1.06→1.39, 1), 50/100 (1.18→0.04, 2).
+mean_reversion QQQ 40/1.5/0.5 (0.44→0.29, 4), 40/2.5/0.5 (0.57→0.00, 0), 40/1.5/0.0 (0.74→−0.89, 10), 10/1.5/0.5
+(0.32→0.19, 9), 10/2.0/0.5 (0.59→−0.06, 7), 40/2.0/0.5 (0.50→−0.87, 4), 20/1.5/0.0 (0.64→1.31, 7).
+
+`python -m bot research compare --symbol SPY --start 2017-01-03 --end 2026-09-26` (report saved by the operator as
+`reports/research_compare_SPY_2017-01-03_2026-09-26.md`):
+
+| Cut | buy_and_hold | ma_crossover | mean_reversion | donchian_breakout | ma_crossover_buffered | trend_vol_filter |
+|---|---|---|---|---|---|---|
+| full 2017-01-03→2026-09-25: total / Sharpe / MaxDD / trades | +241.6% / 0.80 / −34.2% / 1 | +29.4% / 0.57 / −11.3% / 10 | +8.2% / 0.30 / −8.1% / 57 | +10.6% / 0.31 / −8.2% / 28 | +29.5% / 0.56 / −11.2% / 10 | +34.6% / 0.71 / −6.7% / 13 |
+| in_sample 2017-01-03→2022-10-28 | +72.4% / 0.58 | +6.0% / 0.25 | +2.0% / 0.13 | +3.8% / 0.20 | +6.6% / 0.27 | +11.6% / 0.50 |
+| validation 2022-10-31→2024-10-10 | +47.6% / 1.49 | +11.6% / 1.40 | +4.1% / 1.07 | +6.5% / 0.91 | +12.8% / 1.56 | +11.6% / 1.40 |
+| held_out_test 2024-10-11→2026-09-25 | +32.6% / 0.96 | +12.2% / 1.19 | +1.8% / 0.35 | +0.1% / 0.03 | +12.0% / 1.16 | +12.2% / 1.19 |
+| walk-forward OOS 2020→2026: total / Sharpe / MaxDD / trades | +139.7% / 0.76 | +12.7% / 0.65 / −5.6% / 15 | −4.4% / −0.27 / −8.6% / 25 | +16.3% / 0.71 / −3.6% / 32 | +18.0% / 0.95 / −3.1% / 6 | +16.1% / 0.73 / −4.4% / 23 |
+
+Regimes (full sample, benchmark-defined): bull 854 days, bear 108, sideways 1,358, high-vol 606, low-vol 1,819.
+ma_crossover annualised: bull +10.0% (Sharpe 2.30), bear −9.1% (−1.52), sideways −0.5% (−0.10), high-vol +0.7%,
+low-vol +3.5%. mean_reversion: bull +2.7%, bear −11.6% (−2.45), sideways +0.6%, high-vol +0.5%, low-vol +1.0%.
+Buy-and-hold: bull +28.7%, bear −102.7%, sideways +14.5%.
+
+Reading (no change to the earlier verdict): on real SPY/QQQ the MA baseline is a drawdown-reduction trade with 6–16
+trades, `mean_reversion` loses money out of sample on both ETFs, and the three research candidates sit within noise of
+the MA baseline. None of these numbers is evidence of edge; they are the reproduction targets for Phase 2.
 
 ### 2.3 Offline proxy baselines already in the repo (reproducible in this environment)
 
