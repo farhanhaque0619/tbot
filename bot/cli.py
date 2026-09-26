@@ -20,6 +20,7 @@ from rich.table import Table
 
 from bot import __version__
 from bot.config import LIVE_CONFIRMATION_PHRASE, Settings, TradingEnv, banner, get_settings
+from bot.monitoring.health import HealthReport
 from bot.monitoring.logging import setup_logging
 
 log = logging.getLogger("bot.cli")
@@ -193,57 +194,96 @@ def _print_safe_summary(safe) -> None:
     console.print(t)
 
 
-def _account_table(env: TradingEnv, settings: Settings, broker, probe_symbol: str) -> tuple[Table, dict[str, Any]]:
+def _account_table(env: TradingEnv, settings: Settings, broker, probe_symbol: str) -> tuple[Table, dict[str, Any], HealthReport]:
+    """Read-only account / connectivity probe. Returns (rich table, info dict, HealthReport). Never orders."""
     from bot.data.calendar import last_completed_session_date, now_ny
+    from bot.monitoring.health import DEGRADED, FAILED, OK, HealthReport, classify_bar_currency, classify_quote_age
 
     info: dict[str, Any] = {"env": env}
+    rep = HealthReport()
     t = Table(title=f"{env.upper()} account / connectivity", header_style="bold", show_lines=False)
     t.add_column("Item"); t.add_column("Value")
     cs = settings.credential_status(env)
     t.add_row("credentials", f"key_present={cs['key_present']} secret_present={cs['secret_present']} prefix={cs['key_prefix']}* prefix_ok={cs['key_prefix_ok']}")
+    rep.add("credentials", OK if cs["key_present"] and cs["secret_present"] and cs["key_prefix_ok"] else FAILED, "presence/prefix")
     a = broker.get_account()
     ok, why = broker.verify_account_env()
     info.update(account_ok=ok, healthy=a.healthy)
     t.add_row("account", f"…{a.account_number[-4:]}  status={a.status}  env-check: {'OK' if ok else 'MISMATCH'} ({why})")
+    rep.add("account_env_matches", OK if ok else FAILED, why)
+    rep.add("account_healthy", OK if a.healthy else FAILED,
+            f"status={a.status} trading_blocked={a.trading_blocked} account_blocked={a.account_blocked} suspended={a.trade_suspended_by_user}")
     t.add_row("equity / cash / buying power", f"{a.equity:,.2f} / {a.cash:,.2f} / {a.buying_power:,.2f} {a.currency}")
     t.add_row("blocked?", f"trading_blocked={a.trading_blocked} account_blocked={a.account_blocked} transfers_blocked={a.transfers_blocked} suspended_by_user={a.trade_suspended_by_user}")
     t.add_row("margin / shorting / PDT", f"multiplier={a.multiplier:g} shorting_enabled={a.shorting_enabled} pattern_day_trader={a.pattern_day_trader} daytrade_count={a.daytrade_count}")
     pos = broker.get_positions()
     oo = broker.get_open_orders()
     t.add_row("positions / open orders", f"{len(pos)} / {len(oo)}")
-    for s, p in pos.items():
-        t.add_row(f"  position {s}", f"{p.qty:+g} @ {p.avg_entry_price:.2f} (now {p.current_price:.2f}, value {p.market_value:,.2f})")
+    for sym, pp in pos.items():
+        t.add_row(f"  position {sym}", f"{pp.qty:+g} @ {pp.avg_entry_price:.2f} (now {pp.current_price:.2f}, value {pp.market_value:,.2f})")
     for o in oo:
         t.add_row(f"  open order {o.client_order_id}", f"{o.side} {o.qty:g} {o.symbol} [{o.status}] tif={o.time_in_force}")
+    rep.add("positions_and_orders_readable", OK, f"{len(pos)} positions, {len(oo)} open orders")
     c = broker.get_clock()
-    t.add_row("market clock", f"{'OPEN' if c.is_open else 'closed'} · now {c.timestamp:%Y-%m-%d %H:%M %Z} · next open {c.next_open:%m-%d %H:%M} · next close {c.next_close:%m-%d %H:%M}")
-    info["market_open"] = c.is_open
+    market_open = bool(c.is_open)
+    t.add_row("market clock", f"{'OPEN' if market_open else 'closed'} · now {c.timestamp:%Y-%m-%d %H:%M %Z} · next open {c.next_open:%m-%d %H:%M} · next close {c.next_close:%m-%d %H:%M}")
+    info["market_open"] = market_open
+    rep.add("market_clock", OK, "open" if market_open else "closed")
+    # --- quote (freshness only matters while the market is open)
+    quote_age = None
     try:
         q = broker.get_latest_quote(probe_symbol)
         if q is not None:
-            age = (now_ny() - q.timestamp).total_seconds()
-            t.add_row(f"latest quote {probe_symbol}", f"bid {q.bid:.2f} ask {q.ask:.2f} spread {q.spread_bps:.1f}bps · {age:.0f}s old · feed={settings.data_feed}")
-            info["quote_age_s"] = age
+            quote_age = (now_ny() - q.timestamp).total_seconds()
+            t.add_row(f"latest quote {probe_symbol}", f"bid {q.bid:.2f} ask {q.ask:.2f} spread {q.spread_bps:.1f}bps · {quote_age:.0f}s old · feed={settings.data_feed}")
         else:
             t.add_row(f"latest quote {probe_symbol}", "unavailable")
+        lvl, detail = classify_quote_age(quote_age, market_open=market_open, max_stale_seconds=settings.max_stale_data_seconds)
+        rep.add("quote_freshness", lvl, detail, required=False)
     except Exception as e:  # noqa: BLE001
         t.add_row(f"latest quote {probe_symbol}", f"error: {type(e).__name__}: {e}")
+        rep.add("quote_freshness", FAILED, f"{type(e).__name__}: {e}", required=False)
+    info["quote_age_s"] = quote_age
+    # --- asset metadata (required: fractionable/tradable gates depend on it)
     try:
         asset = broker.get_asset(probe_symbol)
         t.add_row(f"asset {probe_symbol}", f"tradable={asset.tradable} fractionable={asset.fractionable} shortable={asset.shortable} marginable={asset.marginable} class={asset.asset_class}")
+        rep.add("asset_metadata", OK if asset.tradable else DEGRADED, f"tradable={asset.tradable} fractionable={asset.fractionable}")
     except Exception as e:  # noqa: BLE001
         t.add_row(f"asset {probe_symbol}", f"error: {type(e).__name__}: {e}")
+        rep.add("asset_metadata", FAILED, f"{type(e).__name__}: {e}")
+    # --- calendar (required) and daily bars (required source; currency of the last bar is DEGRADED-only)
+    sess = None
+    try:
+        sessions = broker.get_sessions(date.today() - timedelta(days=10), date.today())
+        sess = last_completed_session_date(now_ny(), sessions)
+        t.add_row("calendar", f"{len(sessions)} sessions in last 10 days · last completed session {sess} · source={sessions[-1].source if sessions else '-'}")
+        rep.add("calendar", OK if sessions else FAILED, f"{len(sessions)} sessions")
+    except Exception as e:  # noqa: BLE001
+        t.add_row("calendar", f"error: {type(e).__name__}: {e}")
+        rep.add("calendar", FAILED, f"{type(e).__name__}: {e}")
     try:
         store, loader = _make_loader(settings, env)
-        sess = last_completed_session_date(now_ny(), broker.get_sessions(date.today() - timedelta(days=10), date.today()))
-        bars = loader.get_daily(probe_symbol, sess - timedelta(days=10), sess)
+        ref = sess or date.today()
+        bars = loader.get_daily(probe_symbol, ref - timedelta(days=10), ref)
+        if bars.empty:  # nothing in the window: distinguish "stale cache" (DEGRADED) from "no data at all" (FAILED)
+            bars = store.get_bars(probe_symbol, adjustment=settings.data_adjustment)
         last_bar = bars.index[-1].date() if len(bars) else None
-        t.add_row(f"daily bars {probe_symbol}", f"last bar {last_bar} · last completed session {sess} · {'CURRENT' if last_bar == sess else 'LAGGING'} · adjustment={settings.data_adjustment}")
-        info["bar_current"] = last_bar == sess
+        if sess is not None:
+            lvl, detail = classify_bar_currency(last_bar, sess)
+        else:
+            lvl, detail = (DEGRADED, f"last bar {last_bar}; session unknown (calendar failed)") if last_bar else (FAILED, "no bars")
+        t.add_row(f"daily bars {probe_symbol}", f"last bar {last_bar} · {detail} · adjustment={settings.data_adjustment}")
+        rep.add("daily_bars", lvl, detail)
+        info["bar_current"] = lvl == OK
     except Exception as e:  # noqa: BLE001
         t.add_row(f"daily bars {probe_symbol}", f"error: {type(e).__name__}: {e}")
+        rep.add("daily_bars", FAILED, f"{type(e).__name__}: {e}")
+        info["bar_current"] = False
     t.add_row("last request id", str(broker.last_request_id))
-    return t, info
+    t.add_row("health", rep.level + ("" if rep.level == "OK" else ": " + "; ".join(f"{c.name}={c.level}" for c in rep.problems())))
+    info["health"] = rep
+    return t, info, rep
 
 
 def cmd_status(args) -> int:
@@ -251,51 +291,51 @@ def cmd_status(args) -> int:
     env: TradingEnv = "live" if args.live else "paper"
     _print_banner(env)
     broker = _broker(settings, env)
-    t, _ = _account_table(env, settings, broker, args.symbol)
+    t, _, rep = _account_table(env, settings, broker, args.symbol)
     console.print(t)
     if env == "live":
         from bot.execution.interlock import LiveInterlock
         armed, detail = LiveInterlock(settings).is_armed()
         console.print(f"interlock: {'ARMED' if armed else 'DISARMED'} ({detail}) · LIVE_AUTONOMOUS_TRADING={settings.live_autonomous_trading} · SAFE_LIVE_TEST_MODE={settings.safe_live_test_mode}")
-    console.print("[dim]read-only: no order was submitted[/dim]")
+    console.print(f"[dim]read-only: no order was submitted · health: {rep.level}[/dim]")
     return 0
 
 
 def cmd_doctor(args) -> int:
-    """Connectivity + configuration health check. Never submits an order."""
+    """Configuration + connectivity health check. Never submits an order.
+
+    Exit codes: 0 OK · 2 DEGRADED (works, but something non-required or transient is off) · 1 FAILED."""
+    from bot.monitoring.health import DEGRADED, FAILED, OK, HealthReport
+
     settings = get_settings()
     env: TradingEnv = "live" if args.live else "paper"
     _print_banner(env)
-    problems: list[str] = []
+    rep = HealthReport()
     for e in ("paper", "live"):
         cs = settings.credential_status(e)
         console.print(f"credentials[{e}]: key_present={cs['key_present']} secret_present={cs['secret_present']} prefix_ok={cs['key_prefix_ok']}")
         if e == env and not (cs["key_present"] and cs["secret_present"]):
-            problems.append(f"{e} credentials missing")
+            rep.add(f"credentials_{e}", FAILED, f"{e} credentials missing")
         if cs["key_present"] and not cs["key_prefix_ok"]:
-            problems.append(f"{e} key has the wrong prefix for its slot (paper=PK…, live=AK…)")
+            rep.add(f"credentials_{e}_prefix", FAILED, f"{e} key has the wrong prefix for its slot (paper=PK…, live=AK…)")
     if Path(".env").exists():
         import subprocess
         tracked = subprocess.run(["git", "ls-files", "--error-unmatch", ".env"], capture_output=True, text=True).returncode == 0
-        if tracked:
-            problems.append(".env is TRACKED by git - remove it from the index and rotate every key in it")
         console.print(f".env present, git-tracked={tracked}")
-    if problems:
-        for p in problems:
-            console.print(f"[red]✗ {p}[/red]")
-        return 1
+        if tracked:
+            rep.add("env_file_not_tracked", FAILED, ".env is TRACKED by git - remove it from the index and rotate every key in it")
+    if rep.level == FAILED:
+        _print_health(rep)
+        return rep.exit_code
     try:
         broker = _broker(settings, env)
-        t, info = _account_table(env, settings, broker, args.symbol)
+        t, info, acct_rep = _account_table(env, settings, broker, args.symbol)
         console.print(t)
-        if not info.get("account_ok"):
-            problems.append("account number shape does not match the requested environment")
-        if not info.get("healthy"):
-            problems.append("account is not healthy (status/blocked flags)")
-        if info.get("quote_age_s") is not None and info["quote_age_s"] > settings.max_stale_data_seconds and info.get("market_open"):
-            problems.append(f"latest quote is {info['quote_age_s']:.0f}s old while the market is open")
+        rep.checks.extend(acct_rep.checks)
+    except SystemExit as e:
+        rep.add("broker_connectivity", FAILED, str(e))
     except Exception as e:  # noqa: BLE001
-        problems.append(f"broker connectivity failed: {type(e).__name__}: {e}")
+        rep.add("broker_connectivity", FAILED, f"{type(e).__name__}: {e}")
     if env == "live":
         from bot.execution.interlock import LiveInterlock
         from bot.risk import SafeLiveLimits
@@ -304,15 +344,19 @@ def cmd_doctor(args) -> int:
         console.print(f"interlock: {'ARMED' if armed else 'DISARMED'} ({detail}); LIVE_AUTONOMOUS_TRADING={settings.live_autonomous_trading}")
         if settings.safe_live_test_mode:
             _print_safe_summary(SafeLiveLimits.from_settings(settings))
+            rep.add("safe_live_test_mode", OK, "ON")
         else:
-            problems.append("SAFE_LIVE_TEST_MODE=false (not recommended for a small account)")
-    if problems:
-        for p in problems:
-            console.print(f"[red]✗ {p}[/red]")
-        console.print("[red]doctor: FAIL[/red]")
-        return 1
-    console.print("[green]doctor: OK (read-only, no orders submitted)[/green]")
-    return 0
+            rep.add("safe_live_test_mode", DEGRADED, "SAFE_LIVE_TEST_MODE=false (not recommended for a small account)")
+    _print_health(rep)
+    return rep.exit_code
+
+
+def _print_health(rep) -> None:
+    for c in rep.problems():
+        colour = "red" if c.level == "FAILED" else "yellow"
+        console.print(f"[{colour}]{'✗' if c.level == 'FAILED' else '!'} {c.name}: {c.level} — {c.detail}[/{colour}]")
+    colour = {"OK": "green", "DEGRADED": "yellow", "FAILED": "red"}[rep.level]
+    console.print(f"[{colour}]doctor: {rep.level}[/{colour}] (read-only, no orders submitted; exit code {rep.exit_code})")
 
 
 def _arm_interactive(settings: Settings) -> None:
@@ -346,7 +390,7 @@ def cmd_live(args) -> int:
         data_fresh = None
         try:
             broker = _broker(settings, "live")
-            t, info = _account_table("live", settings, broker, args.symbol)
+            t, info, _rep = _account_table("live", settings, broker, args.symbol)
             console.print(t)
             account = broker.get_account()
             env_ok = broker.verify_account_env()

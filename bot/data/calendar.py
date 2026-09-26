@@ -42,6 +42,30 @@ def daily_ts(d: date) -> pd.Timestamp:
     return pd.Timestamp(datetime.combine(d, time(0, 0))).tz_localize(NY_TZ)
 
 
+def normalize_session_time(session_date: date, value: datetime | time) -> datetime:
+    """Normalise an Alpaca calendar ``open``/``close`` value to an aware America/New_York datetime.
+
+    Accepted inputs and their interpretation:
+    - ``datetime.time``: combined with ``session_date`` in New York time.
+    - naive ``datetime.datetime``: interpreted as New York wall-clock time. This is what alpaca-py produces:
+      the /v2/calendar API returns ``"open": "09:30"`` (exchange local time, America/New_York) and
+      ``alpaca.trading.models.Calendar.__init__`` parses ``f"{date} {open}"`` with ``strptime("%Y-%m-%d %H:%M")``
+      into a NAIVE datetime. Its date part is trusted only if it matches ``session_date``; otherwise the time
+      part is re-attached to ``session_date`` (the calendar entry's date is authoritative).
+    - aware ``datetime.datetime``: converted with ``astimezone(NY)``; tzinfo is never blindly replaced.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(NY)
+        if value.date() != session_date:
+            log.warning("calendar value %s does not match session date %s; using the session date", value, session_date)
+            return datetime.combine(session_date, value.time(), NY)
+        return value.replace(tzinfo=NY)
+    if isinstance(value, time):
+        return datetime.combine(session_date, value.replace(tzinfo=None), NY)
+    raise TypeError(f"unsupported calendar time value {value!r} ({type(value).__name__})")
+
+
 @dataclass(frozen=True)
 class SessionInfo:
     date: date

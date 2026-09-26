@@ -20,7 +20,7 @@ from datetime import date, datetime
 from typing import Protocol
 
 from bot.config import Settings, TradingEnv
-from bot.data.calendar import NY, SessionInfo
+from bot.data.calendar import NY, SessionInfo, normalize_session_time
 from bot.utils.retry import with_retry
 
 log = logging.getLogger(__name__)
@@ -343,12 +343,17 @@ class AlpacaBroker:
         from alpaca.trading.requests import GetCalendarRequest
 
         days = with_retry(lambda: self.client.get_calendar(GetCalendarRequest(start=start, end=end)), what="get_calendar")
-        out = []
-        for d in days:
-            o = datetime.combine(d.date, d.open, NY)
-            c = datetime.combine(d.date, d.close, NY)
-            out.append(SessionInfo(d.date, o, c, "alpaca"))
-        return out
+        return [self.session_from_calendar(d) for d in days]
+
+    @staticmethod
+    def session_from_calendar(d) -> SessionInfo:
+        """Normalisation boundary for alpaca-py ``Calendar`` objects (open/close may be time, naive or aware datetime)."""
+        session_date = d.date if isinstance(d.date, date) else datetime.fromisoformat(str(d.date)).date()
+        o = normalize_session_time(session_date, d.open)
+        c = normalize_session_time(session_date, d.close)
+        if c <= o:
+            raise ValueError(f"calendar entry {session_date}: close {c} is not after open {o}")
+        return SessionInfo(session_date, o, c, "alpaca")
 
     # --------------------------------------------------------------- helpers
     @staticmethod
