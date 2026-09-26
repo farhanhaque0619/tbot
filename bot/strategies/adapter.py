@@ -17,7 +17,10 @@ from bot.strategies.base import Bar, Strategy
 
 @dataclass
 class PositionView:
+    """What a module may know about its own slice: quantity, average price and its weight in equity. Nothing else."""
     qty: float = 0.0
+    avg_price: float | None = None
+    weight: float | None = None          # signed slice notional / equity; None when unknown
 
     @property
     def side(self) -> int:

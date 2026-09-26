@@ -222,6 +222,13 @@ def run_daily_legacy(strategy_factory: Callable[[], Strategy], data: dict[str, p
     return res
 
 
+def _pos(risk: RiskEngine, module_id: str, symbol: str, prices: dict[str, float], equity: float) -> SlicePos:
+    sl = risk.ledger.slice(module_id, symbol)
+    px = prices.get(symbol, sl.avg_price)
+    w = (sl.qty * px / equity) if (equity > 0 and px) else None
+    return SlicePos(sl.qty, avg_price=sl.avg_price if abs(sl.qty) > 1e-12 else None, weight=w)
+
+
 def _slice_has_open_order(oms: OrderManager, m: str, s: str) -> bool:
     return any(o.module_id == m and o.symbol == s and o.is_open for o in oms.orders.values())
 
@@ -233,7 +240,7 @@ def _loc(ts, like) -> pd.Timestamp:
     return ts
 
 
-# =============================================================================================== minute mode
+# =============================================================================================== V1.5 modules
 KIND_ORDER = ("pre_open", "session_open", "bar_close_1m", "bar_close_30m", "t1530", "t1550", "t1558", "session_close")
 KIND_EVENTS = {"bar_close_1m": ("bar_close", "1m"), "bar_close_30m": ("bar_close", "30m")}
 
@@ -242,8 +249,10 @@ class Module:
     """Protocol for V1.5 modules: ``module_id``, ``symbols``, ``listens`` (names from KIND_ORDER), ``on_event``.
 
     ``on_event`` receives a ScheduleEvent (``bar_close`` carries ``timeframe`` "1m"/"30m"), the symbol's FeatureSnapshot
-    and the module's own slice; it returns TradeIntents. When several listened kinds coincide on one bar the module is
-    called once per kind, in KIND_ORDER; the OrderManager skips a second order for a slice that already has one open.
+    and the module's own slice (PositionView: qty, avg_price, weight); it returns TradeIntents. When several listened
+    kinds coincide on one bar the module is called once per kind, in KIND_ORDER; the OrderManager skips a second order
+    for a slice that already has one open. A module that defines ``on_event_batch(event, snapshots, positions)`` is
+    called once per kind with all its symbols (cross-sectional modules such as M3).
     Orders on one symbol from different modules in the same event are serialised by the one-open-order-per-symbol
     rule (RiskManager ``no_outstanding_order_conflict``): the later module's intent is blocked for that event.
     """
@@ -265,112 +274,135 @@ class MinuteRunConfig:
     quotes: dict[str, pd.DataFrame] | None = None       # optional per-symbol quote frames (bid, ask) indexed by ts
     run_id: str = "bt15"
     record_minute_equity: bool = False                  # False: one equity mark per session close (plus open)
+    throttle: bool = True                               # research protocol runs set False: evaluate the rule, not the throttle
 
 
-def run_minute(modules: list[Module], bars_1m: dict[str, pd.DataFrame], *, calendar: SessionCalendar, policy: RiskPolicy,
-               start: date, end: date, config: MinuteRunConfig | None = None, features: FeatureEngine | None = None) -> BacktestResultV15:
-    cfg = config or MinuteRunConfig()
-    bars_1m = {s.upper(): df for s, df in bars_1m.items()}
-    symbols = list(bars_1m)
-    updates: list[TradeUpdateEvent] = []
-    fe = FillEngine(cfg.fills)
-    broker = SimBroker(cfg.initial_cash, fills=fe, symbol_kinds=cfg.symbol_kinds, on_trade_update=updates.append,
-                       whole_share_only=False)
-    risk = RiskEngine(policy, sectors=cfg.sectors, allow_fractional=True)
-    features = features or FeatureEngine(benchmark="SPY" if "SPY" in symbols else symbols[0], calendar=calendar)
-    allocator = Allocator(policy, sectors=cfg.sectors, whole_share_capable=cfg.whole_share_capable)
-    oms = OrderManager(broker, risk, policy, run_id=cfg.run_id, clock=lambda: broker.now, whole_share_capable=cfg.whole_share_capable,
-                       symbol_kind=lambda s: cfg.symbol_kinds.get(s, "etf"))
-    rng = random.Random(cfg.fills.seed)
-    delay_queue: list[tuple[int, TradeIntent]] = []
-    lots: dict[tuple[str, str], dict[str, Any]] = {}
-    trades: list[Trade] = []
-    module_trades: dict[str, list[Trade]] = {m.module_id: [] for m in modules}
-    module_cash: dict[str, float] = {m.module_id: 0.0 for m in modules}
-    module_eq: dict[str, list[tuple[datetime, float]]] = {m.module_id: [] for m in modules}
-    attribution = {m.module_id: {"overnight": 0.0, "intraday": 0.0} for m in modules}
-    eq_marks: list[tuple[datetime, float, float]] = []
-    prices: dict[str, float] = {}
-    spreads: dict[str, float] = {}
-    stale: dict[str, float] = {}
-    sessions = [s for s in calendar.sessions_between(start, end)]
-    by_session = {s: {} for s in symbols}
-    for s, df in bars_1m.items():
-        idx = pd.DatetimeIndex(df.index).tz_convert(NY)
-        for d, g in df.set_index(idx).groupby(idx.date):
-            by_session[s][d] = g
+def _pos(risk: RiskEngine, module_id: str, symbol: str, prices: dict[str, float], equity: float) -> SlicePos:
+    sl = risk.ledger.slice(module_id, symbol)
+    px = prices.get(symbol, sl.avg_price)
+    w = (sl.qty * px / equity) if (equity > 0 and px) else None
+    return SlicePos(sl.qty, avg_price=sl.avg_price if abs(sl.qty) > 1e-12 else None, weight=w)
 
-    def module_value(mid: str) -> float:
-        return module_cash[mid] + sum(sl.qty * prices.get(sl.symbol, sl.avg_price) for (m, _), sl in risk.ledger.slices.items() if m == mid)
 
-    def drain(ts: datetime, session: date):
-        while updates:
-            ev = updates.pop(0)
-            oms.on_trade_update(ev, session=session)
-            rec = oms.orders.get(ev.client_order_id)
+class _Core:
+    """Shared machinery of the minute and daily drivers: broker, risk, features, allocator, OMS, trade bookkeeping,
+    per-kind dispatch, attribution and the kill switch. Both drivers only differ in how they walk the session."""
+
+    def __init__(self, modules: list[Module], symbols: list[str], *, calendar: SessionCalendar, policy: RiskPolicy,
+                 cfg: MinuteRunConfig, features: FeatureEngine | None):
+        self.modules, self.symbols, self.calendar, self.policy, self.cfg = modules, symbols, calendar, policy, cfg
+        self.updates: list[TradeUpdateEvent] = []
+        self.broker = SimBroker(cfg.initial_cash, fills=FillEngine(cfg.fills), symbol_kinds=cfg.symbol_kinds,
+                                on_trade_update=self.updates.append, whole_share_only=False)
+        self.risk = RiskEngine(policy, sectors=cfg.sectors, allow_fractional=True, throttle_enabled=cfg.throttle)
+        self.features = features or FeatureEngine(benchmark="SPY" if "SPY" in symbols else symbols[0], calendar=calendar)
+        self.allocator = Allocator(policy, sectors=cfg.sectors, whole_share_capable=cfg.whole_share_capable)
+        self.oms = OrderManager(self.broker, self.risk, policy, run_id=cfg.run_id, clock=lambda: self.broker.now,
+                                whole_share_capable=cfg.whole_share_capable, symbol_kind=lambda s: cfg.symbol_kinds.get(s, "etf"))
+        self.rng = random.Random(cfg.fills.seed)
+        self.delay_queue: list[tuple[int, TradeIntent]] = []
+        self.lots: dict[tuple[str, str], dict[str, Any]] = {}
+        self.trades: list[Trade] = []
+        self.module_trades: dict[str, list[Trade]] = {m.module_id: [] for m in modules}
+        self.module_cash: dict[str, float] = {m.module_id: 0.0 for m in modules}
+        self.module_eq: dict[str, list[tuple[datetime, float]]] = {m.module_id: [] for m in modules}
+        self.attribution = {m.module_id: {"overnight": 0.0, "intraday": 0.0} for m in modules}
+        self.eq_marks: list[tuple[datetime, float, float]] = []
+        self.prices: dict[str, float] = {}
+        self.spreads: dict[str, float] = {}
+        self.stale: dict[str, float] = {}
+        self.killed_handled = False
+        self._session_base: dict[str, float] = {}
+
+    # ------------------------------------------------------------- bookkeeping
+    def module_value(self, mid: str) -> float:
+        return self.module_cash[mid] + sum(sl.qty * self.prices.get(sl.symbol, sl.avg_price) for (m, _), sl in self.risk.ledger.slices.items() if m == mid)
+
+    def gross(self) -> float:
+        return sum(abs(q) * self.prices.get(s, 0) for s, q in self.broker.positions.items())
+
+    def mark(self, ts: datetime) -> None:
+        self.eq_marks.append((ts, self.broker.equity(), self.gross()))
+
+    def drain(self, ts: datetime, session: date) -> None:
+        while self.updates:
+            ev = self.updates.pop(0)
+            self.oms.on_trade_update(ev, session=session)
+            rec = self.oms.orders.get(ev.client_order_id)
             if rec is None or ev.event not in ("fill", "partial_fill"):
                 continue
             inc = ev.raw.get("leg_qty") or 0.0
             price = ev.price or rec.reference_price
             signed = inc if rec.side == "buy" else -inc
-            module_cash[rec.module_id] -= signed * price
+            self.module_cash[rec.module_id] -= signed * price
             key = (rec.module_id, rec.symbol)
             if rec.kind == "entry":
-                lot = lots.setdefault(key, {"entry_ts": ts, "entry_price": price, "qty": 0.0, "bars": 0, "side": 1 if rec.side == "buy" else -1, "entry_reason": rec.style})
+                lot = self.lots.setdefault(key, {"entry_ts": ts, "entry_price": price, "qty": 0.0, "bars": 0, "side": 1 if rec.side == "buy" else -1, "entry_reason": rec.style})
                 lot["entry_price"] = (lot["entry_price"] * lot["qty"] + price * inc) / (lot["qty"] + inc) if lot["qty"] + inc > 0 else price
                 lot["qty"] += inc
-            elif key in lots:
-                lot = lots[key]
+            elif key in self.lots:
+                lot = self.lots[key]
                 q = min(inc, lot["qty"])
                 pnl = lot["side"] * (price - lot["entry_price"]) * q
                 tr = Trade(rec.symbol, lot["side"], q, lot["entry_ts"], lot["entry_price"], ts, price, pnl, pnl / (lot["entry_price"] * q) if q else 0.0,
                            lot["bars"], lot["entry_reason"], rec.kind)
-                trades.append(tr)
-                module_trades[rec.module_id].append(tr)
+                self.trades.append(tr)
+                self.module_trades[rec.module_id].append(tr)
                 lot["qty"] -= q
                 if lot["qty"] <= 1e-9:
-                    lots.pop(key, None)
+                    self.lots.pop(key, None)
 
-    def dispatch(ts: datetime, session: date, kinds: set[str]):
+    # --------------------------------------------------------------- dispatch
+    def dispatch(self, ts: datetime, session: date, kinds: set[str]) -> None:
         """Deliver one ScheduleEvent per (module, listened kind) in KIND_ORDER; modules see kinds, never raw bars."""
-        acct = broker.get_account()
+        cfg, risk, oms, prices = self.cfg, self.risk, self.oms, self.prices
+        acct = self.broker.get_account()
         new_intents: list[TradeIntent] = []
-        for mod in modules:
+        for mod in self.modules:
             hit = [k for k in KIND_ORDER if k in kinds and k in mod.listens]
             if not hit:
                 continue
-            for sym in mod.symbols:
-                if sym not in symbols:
-                    continue
-                snap = features.snapshot(sym, ts)
-                sl = risk.ledger.slice(mod.module_id, sym)
-                emitted: list[TradeIntent] = []
+            if hasattr(mod, "on_event_batch"):
+                syms = [x for x in mod.symbols if x in self.symbols]
+                snaps = {x: self.features.snapshot(x, ts) for x in syms}
+                poss = {x: _pos(risk, mod.module_id, x, prices, acct.equity) for x in syms}
                 for k in hit:
                     kind, tf = KIND_EVENTS.get(k, (k, None))
-                    emitted.extend(mod.on_event(ScheduleEvent(kind, ts, session, tf), snap, SlicePos(sl.qty)))
-                for it in emitted:
-                    if cfg.fills.drop_signal_fraction > 0 and it.direction != 0 and rng.random() < cfg.fills.drop_signal_fraction:
-                        oms.decisions.append({"ts": ts.isoformat(), "module": it.module_id, "symbol": sym, "decision": "dropped(stress)", "detail": ""})
-                        continue
-                    new_intents.append(it)
+                    new_intents.extend(mod.on_event_batch(ScheduleEvent(kind, ts, session, tf), snaps, poss))
+                continue
+            for sym in mod.symbols:
+                if sym not in self.symbols:
+                    continue
+                snap = self.features.snapshot(sym, ts)
+                for k in hit:
+                    kind, tf = KIND_EVENTS.get(k, (k, None))
+                    new_intents.extend(mod.on_event(ScheduleEvent(kind, ts, session, tf), snap, _pos(risk, mod.module_id, sym, prices, acct.equity)))
+        if cfg.fills.drop_signal_fraction > 0:
+            kept = []
+            for it in new_intents:
+                if it.direction != 0 and self.rng.random() < cfg.fills.drop_signal_fraction:
+                    oms.decisions.append({"ts": ts.isoformat(), "module": it.module_id, "symbol": it.symbol, "decision": "dropped(stress)", "detail": ""})
+                else:
+                    kept.append(it)
+            new_intents = kept
         if cfg.fills.execution_delay_bars > 0:
-            delay_queue.extend((cfg.fills.execution_delay_bars, it) for it in new_intents)
+            self.delay_queue.extend((cfg.fills.execution_delay_bars, it) for it in new_intents)
             new_intents = []
         ready = []
-        for i in range(len(delay_queue) - 1, -1, -1):
-            n, it = delay_queue[i]
+        for i in range(len(self.delay_queue) - 1, -1, -1):
+            n, it = self.delay_queue[i]
             if n <= 0:
-                ready.append(it); delay_queue.pop(i)
+                ready.append(it); self.delay_queue.pop(i)
             else:
-                delay_queue[i] = (n - 1, it)
+                self.delay_queue[i] = (n - 1, it)
         new_intents.extend(reversed(ready))
         if not new_intents:
             return
         admitted = []
-        recent = [x.date for x in calendar.sessions_between(session - timedelta(days=9), session)]
+        recent = [x.date for x in self.calendar.sessions_between(session - timedelta(days=9), session)]
         for it in new_intents:
-            d = risk.admit(it, spread_bps=spreads.get(it.symbol), stale_seconds=stale.get(it.symbol), is_etf=cfg.symbol_kinds.get(it.symbol, "etf") == "etf",
-                           account=acct, recent_sessions=recent)
+            d = risk.admit(it, spread_bps=self.spreads.get(it.symbol), stale_seconds=self.stale.get(it.symbol),
+                           is_etf=cfg.symbol_kinds.get(it.symbol, "etf") == "etf", account=acct, recent_sessions=recent)
             if d.approved:
                 mult = risk.budget_multiplier(it.module_id)
                 admitted.append(it if mult >= 1.0 else TradeIntent(**{**it.__dict__, "risk_budget_pct": it.risk_budget_pct * mult}))
@@ -379,11 +411,69 @@ def run_minute(modules: list[Module], bars_1m: dict[str, pd.DataFrame], *, calen
         if not admitted:
             return
         views = [PositionView(x.symbol, x.module_id, x.qty, prices.get(x.symbol, x.avg_price)) for x in risk.ledger.slices.values() if abs(x.qty) > 1e-12]
-        alloc = allocator.allocate(admitted, views, acct.equity, cash=acct.cash)
-        oms.reconcile(alloc.targets, account=acct, prices=prices, session=session, market_open=True, spreads=spreads, stale=stale)
+        alloc = self.allocator.allocate(admitted, views, acct.equity, cash=acct.cash)
+        oms.reconcile(alloc.targets, account=acct, prices=prices, session=session, market_open=True, spreads=self.spreads, stale=self.stale)
 
-    killed_handled = False
-    for sess in sessions:
+    # ------------------------------------------------------------ attribution
+    def before_open(self) -> tuple[dict, dict, dict]:
+        held = {(m, s): sl.qty for (m, s), sl in self.risk.ledger.slices.items() if abs(sl.qty) > 1e-12}
+        return {m: self.module_value(m) for m in self.module_cash}, held, dict(self.prices)
+
+    def after_open(self, prev_values: dict, held: dict, prev_px: dict) -> None:
+        """overnight = prev close -> official open on positions HELD into the session; everything else (auction fills
+        and their costs, intraday moves) is intraday, so overnight + intraday = the module's P&L."""
+        for m in self.module_cash:
+            on = sum(q * (self.prices[s] - prev_px.get(s, self.prices[s])) for (mm, s), q in held.items() if mm == m)
+            self.attribution[m]["overnight"] += on
+            self._session_base[m] = prev_values[m] + on
+
+    def after_close(self, ts: datetime) -> None:
+        for m in self.module_cash:
+            self.attribution[m]["intraday"] += self.module_value(m) - self._session_base.get(m, self.module_value(m))
+            self.module_eq[m].append((ts, self.module_value(m)))
+
+    def risk_mark(self, ts: datetime) -> float:
+        eq = self.broker.equity()
+        for ev_r in self.risk.update_equity(ts, eq):
+            if ev_r.kind == "kill_switch" and not self.killed_handled:
+                self.killed_handled = True
+                self.oms.cancel_non_protective()
+                self.oms.flatten_all(reason="kill switch")
+        return eq
+
+    # ---------------------------------------------------------------- result
+    def result(self) -> BacktestResultV15:
+        idx = pd.DatetimeIndex([m[0] for m in self.eq_marks])
+        equity = pd.Series([m[1] for m in self.eq_marks], index=idx, name="equity")
+        gross = pd.Series([m[2] for m in self.eq_marks], index=idx)
+        daily_eq = equity[[ts.time() >= time(15, 59) or ts.time() == time(16, 0) or ts.time() == time(13, 0) for ts in equity.index]]
+        daily_eq = daily_eq if len(daily_eq) >= 2 else equity
+        metrics = compute_metrics(daily_eq, self.trades, exposure=float((gross > 0).mean()) if len(gross) else 0.0)
+        b = self.broker
+        metrics.update(costs_paid=b.costs_paid, orders=len(b.by_id), traded_notional=b.traded_notional, kill_switch=bool(self.risk.killed))
+        res = BacktestResultV15(daily_eq, self.trades, metrics,
+                                module_equity={m: pd.Series([v for _, v in xs], index=pd.DatetimeIndex([t for t, _ in xs])) for m, xs in self.module_eq.items()},
+                                module_trades=self.module_trades, fills=b.fills_log, decisions=self.oms.decisions, costs_paid=b.costs_paid, orders=len(b.by_id),
+                                exposure=gross / equity, attribution=self.attribution, killed=self.risk.killed,
+                                strategy="+".join(m.module_id for m in self.modules), symbols=self.symbols)
+        if self.risk.killed:
+            res.notes.append(f"KILL SWITCH TRIPPED: {self.risk.manager.state.kill_reason}")
+        return res
+
+
+def run_minute(modules: list[Module], bars_1m: dict[str, pd.DataFrame], *, calendar: SessionCalendar, policy: RiskPolicy,
+               start: date, end: date, config: MinuteRunConfig | None = None, features: FeatureEngine | None = None) -> BacktestResultV15:
+    cfg = config or MinuteRunConfig()
+    bars_1m = {s.upper(): df for s, df in bars_1m.items()}
+    symbols = list(bars_1m)
+    core = _Core(modules, symbols, calendar=calendar, policy=policy, cfg=cfg, features=features)
+    broker, oms, features, prices = core.broker, core.oms, core.features, core.prices
+    by_session = {s: {} for s in symbols}
+    for s, df in bars_1m.items():
+        idx = pd.DatetimeIndex(df.index).tz_convert(NY)
+        for d, g in df.set_index(idx).groupby(idx.date):
+            by_session[s][d] = g
+    for sess in calendar.sessions_between(start, end):
         d = sess.date
         day_bars = {s: by_session[s].get(d) for s in symbols}
         if all(v is None or v.empty for v in day_bars.values()):
@@ -392,25 +482,17 @@ def run_minute(modules: list[Module], bars_1m: dict[str, pd.DataFrame], *, calen
         pre = datetime.combine(d, time(9, 0), NY)
         broker.now = pre
         oms.on_schedule(ScheduleEvent("pre_open", pre, d), prices=prices)
-        dispatch(pre, d, {"pre_open"})
+        core.dispatch(pre, d, {"pre_open"})
         # opening auction: official open = first minute bar's open
-        # attribution: overnight = prev close -> official open on positions HELD into the session; everything else
-        # (auction fills and their costs, intraday moves) is intraday, so overnight + intraday = the module's P&L
-        prev_values = {m: module_value(m) for m in module_cash}
-        held = {(m, s): sl.qty for (m, s), sl in risk.ledger.slices.items() if abs(sl.qty) > 1e-12}
-        prev_px = dict(prices)
+        prev_values, held, prev_px = core.before_open()
         for s, v in day_bars.items():
             if v is not None and not v.empty:
                 broker.session_open(s, float(v["open"].iloc[0]), sess.open)
                 prices[s] = float(v["open"].iloc[0])
-        drain(sess.open, d)
-        session_base = {}
-        for m in module_cash:
-            on = sum(q * (prices[s] - prev_px.get(s, prices[s])) for (mm, s), q in held.items() if mm == m)
-            attribution[m]["overnight"] += on
-            session_base[m] = prev_values[m] + on
-        eq_marks.append((sess.open, broker.equity(), sum(abs(q) * prices.get(s, 0) for s, q in broker.positions.items())))
-        dispatch(sess.open, d, {"session_open"})
+        core.drain(sess.open, d)
+        core.after_open(prev_values, held, prev_px)
+        core.mark(sess.open)
+        core.dispatch(sess.open, d, {"session_open"})
         acc30: dict[str, list] = {s: [] for s in symbols}
         for ts in minutes:
             ts = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
@@ -425,7 +507,7 @@ def run_minute(modules: list[Module], bars_1m: dict[str, pd.DataFrame], *, calen
                 bars_now[s] = ev
                 broker.step(ev)          # fills for orders decided on earlier bars
                 prices[s] = ev.close
-                stale[s] = 0.0
+                core.stale[s] = 0.0
                 if cfg.quotes and s in cfg.quotes:
                     q = cfg.quotes[s]
                     sub = q[(q.index <= ts)]
@@ -433,13 +515,13 @@ def run_minute(modules: list[Module], bars_1m: dict[str, pd.DataFrame], *, calen
                         last = sub.iloc[-1]
                         qe = QuoteEvent(s, sub.index[-1].to_pydatetime(), float(last["bid"]), float(last["ask"]))
                         features.on_quote(qe)
-                        spreads[s] = qe.spread_bps
+                        core.spreads[s] = qe.spread_bps
                         broker.set_quote_spread(s, qe.spread_bps)
-            drain(ts, d)
+            core.drain(ts, d)
             for s, ev in bars_now.items():
                 features.on_bar(ev)
                 acc30[s].append(ev)
-            oms.tick(prices=prices, spreads=spreads)
+            oms.tick(prices=prices, spreads=core.spreads)
             kinds = {"bar_close_1m"}
             end_of_bucket = ((ts - sess.open).total_seconds() // 60 + 1) % 30 == 0 or (ts + timedelta(minutes=1) >= sess.close)
             # schedule kinds are relative to the session close so early closes (13:00) get the same 30/10/2-minute marks;
@@ -463,43 +545,104 @@ def run_minute(modules: list[Module], bars_1m: dict[str, pd.DataFrame], *, calen
             for k in ("t1530", "t1550", "t1558"):
                 if k in kinds:
                     oms.on_schedule(ScheduleEvent(k, ts, d), prices=prices)
-            dispatch(ts, d, kinds)
-            # risk on minute marks
-            eq = broker.equity()
-            for ev_r in risk.update_equity(ts, eq):
-                if ev_r.kind == "kill_switch" and not killed_handled:
-                    killed_handled = True
-                    oms.cancel_non_protective()
-                    oms.flatten_all(reason="kill switch")
+            core.dispatch(ts, d, kinds)
+            eq = core.risk_mark(ts)
             if cfg.record_minute_equity:
-                eq_marks.append((ts, eq, sum(abs(q) * prices.get(s, 0) for s, q in broker.positions.items())))
-            for lot in lots.values():
+                core.eq_marks.append((ts, eq, core.gross()))
+            for lot in core.lots.values():
                 lot["bars"] += 1
         # closing auction
         for s, v in day_bars.items():
             if v is not None and not v.empty:
                 broker.session_close(s, float(v["close"].iloc[-1]), sess.close)
                 prices[s] = float(v["close"].iloc[-1])
-        drain(sess.close, d)
+        core.drain(sess.close, d)
         broker.end_of_day(sess.close)
-        drain(sess.close, d)
-        for m in module_cash:
-            attribution[m]["intraday"] += module_value(m) - session_base[m]
-            module_eq[m].append((sess.close, module_value(m)))
-        eq_marks.append((sess.close, broker.equity(), sum(abs(q) * prices.get(s, 0) for s, q in broker.positions.items())))
-        dispatch(sess.close, d, {"session_close"})
-        drain(sess.close, d)
-    idx = pd.DatetimeIndex([m[0] for m in eq_marks])
-    equity = pd.Series([m[1] for m in eq_marks], index=idx, name="equity")
-    gross = pd.Series([m[2] for m in eq_marks], index=idx)
-    daily_eq = equity[[ts.time() >= time(15, 59) or ts.time() == time(16, 0) or ts.time() == time(13, 0) for ts in equity.index]]
-    daily_eq = daily_eq if len(daily_eq) >= 2 else equity
-    metrics = compute_metrics(daily_eq, trades, exposure=float((gross > 0).mean()) if len(gross) else 0.0)
-    metrics.update(costs_paid=broker.costs_paid, orders=len(broker.by_id), traded_notional=broker.traded_notional, kill_switch=bool(risk.killed))
-    res = BacktestResultV15(daily_eq, trades, metrics, module_equity={m: pd.Series([v for _, v in xs], index=pd.DatetimeIndex([t for t, _ in xs])) for m, xs in module_eq.items()},
-                            module_trades=module_trades, fills=broker.fills_log, decisions=oms.decisions, costs_paid=broker.costs_paid, orders=len(broker.by_id),
-                            exposure=gross / equity, attribution=attribution, killed=risk.killed, strategy="+".join(m.module_id for m in modules),
-                            symbols=symbols)
-    if risk.killed:
-        res.notes.append(f"KILL SWITCH TRIPPED: {risk.manager.state.kill_reason}")
-    return res
+        core.drain(sess.close, d)
+        core.after_close(sess.close)
+        core.mark(sess.close)
+        core.dispatch(sess.close, d, {"session_close"})
+        core.drain(sess.close, d)
+    return core.result()
+
+
+def run_daily_v15(modules: list[Module], daily: dict[str, pd.DataFrame], *, calendar: SessionCalendar, policy: RiskPolicy,
+                  start: date, end: date, config: MinuteRunConfig | None = None, features: FeatureEngine | None = None,
+                  warmup_sessions: int = 0) -> BacktestResultV15:
+    """Daily-bar driver for close-to-close modules (M1, M3, the legacy adapters) through the same spine as ``run_minute``.
+
+    Per session: pre_open -> opening auction (OPG fills at the official open) -> the day's bar fills market/limit/stop
+    orders decided on earlier sessions (market at the open with slippage, stops elected/gap-filled inside the bar) ->
+    closing auction (CLS fills at the official close) -> DAY orders expire -> features see the 1d bar -> session_close
+    dispatch. An intent emitted at the close therefore fills no earlier than the next session (no lookahead). Minute
+    kinds (bar_close, t1530/t1550/t1558) never fire, so M2 cannot run here. ``warmup_sessions`` bars before ``start``
+    feed the features without trading (equity is marked from ``start``).
+    """
+    cfg = config or MinuteRunConfig()
+    daily = {s.upper(): df for s, df in daily.items()}
+    symbols = list(daily)
+    core = _Core(modules, symbols, calendar=calendar, policy=policy, cfg=cfg, features=features)
+    broker, oms, features, prices = core.broker, core.oms, core.features, core.prices
+    by_day: dict[str, dict[date, Any]] = {}
+    for s, df in daily.items():
+        idx = pd.DatetimeIndex(df.index)
+        idx = idx.tz_convert(NY) if idx.tz is not None else idx.tz_localize(NY)
+        by_day[s] = {ts.date(): row for ts, row in zip(idx, df.itertuples(index=False))}
+    all_days = sorted(set().union(*[set(v) for v in by_day.values()]))
+    trade_days = [d for d in all_days if start <= d <= end]
+    warm = [d for d in all_days if d < start][-warmup_sessions:] if warmup_sessions else []
+    for d in warm:
+        sess = calendar.session(d)
+        if sess is None:
+            continue
+        for s in symbols:
+            row = by_day[s].get(d)
+            if row is not None:
+                features.on_bar(BarEvent(s, sess.close, float(row.open), float(row.high), float(row.low), float(row.close), float(row.volume), "1d", d, is_session_end=True))
+                prices[s] = float(row.close)
+    for d in trade_days:
+        sess = calendar.session(d)
+        if sess is None:
+            continue
+        rows = {s: by_day[s].get(d) for s in symbols}
+        if all(r is None for r in rows.values()):
+            continue
+        pre = datetime.combine(d, time(9, 0), NY)
+        broker.now = pre
+        oms.on_schedule(ScheduleEvent("pre_open", pre, d), prices=prices)
+        core.dispatch(pre, d, {"pre_open"})
+        prev_values, held, prev_px = core.before_open()
+        for s, r in rows.items():
+            if r is not None:
+                broker.session_open(s, float(r.open), sess.open)
+                prices[s] = float(r.open)
+        core.drain(sess.open, d)
+        core.after_open(prev_values, held, prev_px)
+        core.mark(sess.open)
+        core.dispatch(sess.open, d, {"session_open"})
+        for s, r in rows.items():
+            if r is None:
+                continue
+            ev = BarEvent(s, sess.open, float(r.open), float(r.high), float(r.low), float(r.close), float(r.volume), "1d", d, is_session_end=True)
+            broker.step(ev)                      # market/limit at the open (+slippage), stops elected within the bar
+            prices[s] = float(r.close)
+            core.stale[s] = 0.0
+        core.drain(sess.open, d)
+        oms.tick(prices=prices, spreads=core.spreads)
+        for s, r in rows.items():
+            if r is not None:
+                broker.session_close(s, float(r.close), sess.close)
+        core.drain(sess.close, d)
+        broker.end_of_day(sess.close)
+        core.drain(sess.close, d)
+        for s, r in rows.items():
+            if r is not None:
+                features.on_bar(BarEvent(s, sess.close, float(r.open), float(r.high), float(r.low), float(r.close), float(r.volume), "1d", d, is_session_end=True))
+        core.after_close(sess.close)
+        core.mark(sess.close)
+        core.risk_mark(sess.close)
+        core.dispatch(sess.close, d, {"session_close"})
+        core.drain(sess.close, d)
+        for lot in core.lots.values():
+            lot["bars"] += 1
+    return core.result()

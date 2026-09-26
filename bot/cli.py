@@ -729,14 +729,23 @@ def build_parser() -> argparse.ArgumentParser:
     rv.add_argument("--out", default="reports")
     rv.set_defaults(fn=cmd_review)
 
-    rr = sub.add_parser("research", help="research harness: compare, surface, regimes (brain layer; never orders)")
-    rr.add_argument("research_cmd", choices=["compare", "surface", "regimes", "hypotheses"])
+    rr = sub.add_parser("research", help="research harness (brain layer; never orders): compare, surface, regimes, hypotheses; "
+                                          "V1.5 protocol: run, report, trials")
+    rr.add_argument("research_cmd", choices=["compare", "surface", "regimes", "hypotheses", "run", "report", "trials"])
     rr.add_argument("--symbol", action="append", default=None)
     rr.add_argument("--start", type=_date, default=None)
     rr.add_argument("--end", type=_date, default=None)
     rr.add_argument("--strategy", default=None)
     rr.add_argument("--cash", type=float, default=100_000.0)
     rr.add_argument("--out", default="reports")
+    rr.add_argument("--module", action="append", default=None, help="protocol: M1, M2, M3, ma_crossover, mean_reversion (repeatable)")
+    rr.add_argument("--cut", default=None, help="protocol run: A, B, C or D (D is sealed: needs --unseal --reason)")
+    rr.add_argument("--params", default=None, help="protocol run: comma-separated key=value overrides, e.g. k=0.75,agreement=true")
+    rr.add_argument("--stress", default="base", help="protocol run: base, spread_x2, slippage_x2, delay_1bar, drop_10pct, adverse_2bps_20pct")
+    rr.add_argument("--unseal", action="store_true", help="protocol: allow the sealed holdout (logged to research/UNSEAL_LOG.md)")
+    rr.add_argument("--reason", default=None, help="protocol: why the holdout is being unsealed (required with --unseal)")
+    rr.add_argument("--fractional", action="store_true", help="protocol: simulate a fractional-only account (DAY orders, no auctions)")
+    rr.add_argument("--n-boot", type=int, default=2000)
     rr.set_defaults(fn=cmd_research)
     return p
 

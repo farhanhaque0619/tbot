@@ -144,3 +144,22 @@ these can be verified from the backtests here.
   buy-and-hold). Not alpha. ~26–56 trades over 20 years cannot establish anything.
 - `mean_reversion`: break-even with fixed parameters, fragile surface, cost-sensitive, crash-exposed. Not a
   candidate for capital; acceptable only as a second infrastructure test on SPY.
+
+---
+
+# V1.5 modules (Phase 3) — research candidates, not promoted
+
+Source: `bot/strategies/v15/`. Exact rules in `V1_5_CODE_PROMPT.md` §5.3–5.5; the code is the specification where the
+two differ and every difference is listed in `V1_5_AUDIT.md` §7. None of these modules has a promotion record
+(`research/PROMOTIONS.md`), so none may trade live; `python -m bot research report` writes their protocol report to
+`research/RESULTS_V1_5.md`.
+
+| Module | Event | Rule (opinion only; the allocator sizes, the policy decides) | Entry / exit style | Overnight |
+|---|---|---|---|---|
+| **M1** vol-managed index trend (SPY, QQQ) | daily close | sigma = max(vol_21d, vol_63d); tsmom = 12-1 month return > 0; w = clip(0.10/sigma, 0, 0.60)·tsmom; emit the target weight on Mondays or when the slice weight is more than 0.10 away; w = 0 exits | `cls` (whole shares) / `market_1555` (fractional); stop = ref·(1 − 4·sigma/√52) | yes |
+| **M2** market intraday momentum (SPY, QQQ) | 15:30 (1-minute bar ending at the entry time) | s = sign(r1) if |r1| > k·sigma_last30 (k = 0.5) else 0; variants: r1/r12 agreement, relvol_1515 > 1, entry 15:15/15:45; one trade per session; software fat-tail exit at 3·sigma_last30 against the position | `marketable_limit`; exit `cls` at t1550 (whole) / `market_1558` at t1558 (fractional); no broker stop | never |
+| **M3** large-cap residual reversal (Tier 3, paper-only) | daily close, cross-sectional | z = res5/sigma_res_21d over eligible names (spread ≤ 5 bps when known, no earnings within 5 sessions, synthetic fraction < 0.2); buy the bottom 3 with z < 0; exit on res5 > 0, after 5 sessions, or a close below ref·(1 − 3·sigma_res·√5) | `opg` (whole) / `limit_at_prev_close_cancel_0945` (fractional); exit `cls`; stop at the fat-tail level | yes |
+
+Shorts: M2 emits s = −1; `RiskPolicy.allow_short=False` (live) turns it into no trade at admission, the module does not
+know. Modules see only their own slice (`PositionView`: qty, avg_price, weight) and a `FeatureSnapshot`; they cannot
+import anything that submits an order (`tests/test_architecture.py`).

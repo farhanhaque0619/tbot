@@ -176,3 +176,30 @@ Decisions made while building (additions to §3):
 Baselines after Phase 2: `python -m bot backtest --strategy ma_crossover --symbol SP500 --start 2000-01-03 --end 2022-12-28 --no-save`
 prints +95.72%, Sharpe 0.51, 26 trades, walk-forward +53.00%, Sharpe 0.55, 56 trades (§2.3, re-run 2026-09-26). §2.1/§2.2 real-data
 numbers cannot be re-run in this environment (no Alpaca route); `bot/backtest/engine.py` and the two baseline strategies are unchanged.
+
+## 7. Phase 3 record (research)
+
+Built: `bot/strategies/v15/{m1_vol_trend,m2_intraday_momentum,m3_residual_reversal}.py`, `bot/research/protocol.py`,
+`research/PROTOCOL.md`, `research/PROMOTIONS.md` (empty), `research/UNSEAL_LOG.md` (empty), `research/RESULTS_V1_5.md`
+(generated), `config/earnings.csv` (header only: no earnings source is reachable from this environment; M3's earnings
+filter is inert until the operator fills it), CLI `research run|report|trials`, `RiskPolicy.load(require_promotions=True)`,
+the causal regime fix in `bot/research/harness.py::classify_regimes`, and in the engine: `PositionView` now carries
+`avg_price` and `weight`, modules may define `on_event_batch` (cross-sectional M3), `run_daily_v15` drives daily-close
+modules through the same spine, `MinuteRunConfig.throttle` lets research evaluate the rule without the production
+throttle. Tests: `tests/v15/test_modules.py`, `tests/v15/test_protocol.py`.
+
+Decisions (additions to §3):
+
+| # | Item | Decision |
+|---|---|---|
+| D13 | Research results in this environment | No Alpaca route here and the cache holds only the SP500/GOOG proxies (to 2022) — cuts B/C/D cannot be run on SPY/QQQ or on minute bars. `RESULTS_V1_5.md` is generated honestly as NOT EVALUATED for all three modules with the exact data the operator must fetch; the protocol itself is exercised end to end in tests on synthetic data (where all three modules fail, as random walks should). No proxy numbers are reported as module results. |
+| D14 | M1 fractional exit style | Spec §5.1's exit list lacks `market_1555`; added so a fractional M1 slice exits the way it enters. |
+| D15 | M2 exit timing for whole shares | A CLS order must be in before 15:50, so whole-share M2 emits its exit at the `t1550` mark with `exit_style="cls"`; fractional M2 exits at `t1558` with `market_1558`, as specified. |
+| D16 | M3 needs the cross-section | The per-symbol `on_event` cannot rank; the engine (and later the daemon) calls `on_event_batch(event, snapshots, positions)` once per event when a module defines it. Spread `None` (no quote data in a backtest) counts as eligible; live admission still enforces the policy spread cap. |
+| D17 | Regime labels | `classify_regimes` compared realised vol with the full-sample quantile (future leak). Now: trend = sign of the trailing 126-day return; vol above the 75th percentile of its own past 252 days, shifted by a day. `python -m bot research regimes` output changes accordingly; nothing in execution uses it. |
+| D18 | Trial registry file | `research/trials.sqlite` is operator data (git-ignored); the report prints its counts so a reset is visible. |
+| D19 | Throttle in research | Protocol runs disable the RiskEngine throttle (`MinuteRunConfig.throttle=False`); the throttle is a production control that would otherwise halve a module's budget mid-backtest after 60 losing trades and hide the rule's own behaviour. Paper/live runs keep it on. |
+
+Baselines after Phase 3: `python -m bot backtest --strategy ma_crossover --symbol SP500 --start 2000-01-03 --end 2022-12-28 --no-save`
+re-run, +95.72%, Sharpe 0.51, 26 trades, walk-forward +53.00%, Sharpe 0.55, 56 trades (§2.3). `bot/backtest/engine.py`,
+`bot/strategies/{ma_crossover,mean_reversion}.py` unchanged; `research compare` and `research surface` still run on the baselines.

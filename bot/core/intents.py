@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 ENTRY_STYLES = ("marketable_limit", "opg", "cls", "market", "market_1555", "limit_at_prev_close_cancel_0945")
-EXIT_STYLES = ("cls", "market_1558", "marketable_limit", "opg", "market")
+EXIT_STYLES = ("cls", "market_1558", "market_1555", "marketable_limit", "opg", "market")
 
 
 @dataclass(frozen=True)

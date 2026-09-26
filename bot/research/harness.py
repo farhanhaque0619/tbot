@@ -34,21 +34,26 @@ def sample_cuts(index: pd.DatetimeIndex, *, is_frac: float = 0.6, val_frac: floa
             Cut("validation", index[a], index[b - 1]), Cut("held_out_test", index[b], index[-1])]
 
 
-def classify_regimes(benchmark_close: pd.Series, *, trend_window: int = 126, trend_thresh: float = 0.10,
-                     vol_window: int = 21, vol_pct: float = 0.75) -> pd.DataFrame:
-    """Deterministic regime labels from the benchmark's *past* returns (no lookahead: rolling windows end at t).
-    bull: trailing 6-month return > +10%; bear: < -10%; sideways: in between. high_vol: trailing 1-month realised
-    vol above the sample's 75th percentile."""
+def classify_regimes(benchmark_close: pd.Series, *, trend_window: int = 126, trend_thresh: float = 0.0,
+                     vol_window: int = 21, vol_pct: float = 0.75, vol_lookback: int = 252) -> pd.DataFrame:
+    """Causal regime labels: everything at date t uses data up to t only.
+
+    trend: sign of the trailing ``trend_window``-day return (bull > +thresh, bear < -thresh, sideways otherwise; the
+    default threshold 0 makes it a pure sign). vol: trailing ``vol_window``-day realised vol compared with the
+    ``vol_pct`` quantile of that vol over the PREVIOUS ``vol_lookback`` days (shifted by one day, at least 63 obs).
+    The previous version compared with the full-sample quantile, which leaked the future into the labels.
+    """
     r = benchmark_close.pct_change()
     trail = benchmark_close / benchmark_close.shift(trend_window) - 1
     vol = r.rolling(vol_window).std() * np.sqrt(TRADING_DAYS)
-    thresh = vol.quantile(vol_pct)
+    thresh = vol.shift(1).rolling(vol_lookback, min_periods=63).quantile(vol_pct)
     out = pd.DataFrame(index=benchmark_close.index)
     out["bull"] = trail > trend_thresh
     out["bear"] = trail < -trend_thresh
     out["sideways"] = trail.abs() <= trend_thresh
-    out["high_vol"] = vol > thresh
-    out["low_vol"] = vol <= thresh
+    known = thresh.notna()
+    out["high_vol"] = known & (vol > thresh)
+    out["low_vol"] = known & (vol <= thresh)
     return out.fillna(False)
 
 

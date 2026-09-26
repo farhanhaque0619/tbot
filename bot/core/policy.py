@@ -15,6 +15,23 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 PdtMode = Literal["legacy_guard", "intraday_margin", "none"]
+LEGACY_MODULES = ("ma_crossover", "mean_reversion")      # V1 baselines: gated by FINAL_REPORT.md, not by the V1.5 protocol
+PROMOTIONS_PATH = Path("research/PROMOTIONS.md")
+
+
+def promoted_modules(path: str | Path = PROMOTIONS_PATH) -> set[str]:
+    """Modules with a promotion record: a line ``## <MODULE> promoted <YYYY-MM-DD>`` in research/PROMOTIONS.md."""
+    p = Path(path)
+    if not p.exists():
+        return set()
+    out = set()
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("## "):          # an indented example inside a code block is not a record
+            continue
+        parts = line.split()
+        if len(parts) >= 4 and parts[1].isidentifier() and parts[2].lower() == "promoted":
+            out.add(parts[1])
+    return out
 
 
 class RiskPolicy(BaseModel):
@@ -66,13 +83,26 @@ class RiskPolicy(BaseModel):
     def module_gross_cap(self, module_id: str) -> float:
         return float(self.max_module_gross_pct.get(module_id, self.max_gross_pct))
 
+    def unpromoted_modules(self, promotions_path: str | Path = PROMOTIONS_PATH) -> list[str]:
+        """Allowed V1.5 modules without a promotion record (spec §11: none of these may trade live)."""
+        promoted = promoted_modules(promotions_path)
+        return [m for m in self.allowed_modules if m not in LEGACY_MODULES and m not in promoted]
+
     @classmethod
-    def load(cls, path: str | Path) -> RiskPolicy:
+    def load(cls, path: str | Path, *, require_promotions: bool = False, promotions_path: str | Path = PROMOTIONS_PATH) -> RiskPolicy:
+        """Load a policy file. With ``require_promotions=True`` (the live path) refuse a policy that allows a V1.5 module
+        without an entry in research/PROMOTIONS.md."""
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         for k in ("allowed_modules", "allowed_symbols"):
             if k in raw and isinstance(raw[k], list):
                 raw[k] = tuple(raw[k])
-        return cls(**raw)
+        pol = cls(**raw)
+        if require_promotions:
+            bad = pol.unpromoted_modules(promotions_path)
+            if bad:
+                raise ValueError(f"policy {path} allows unpromoted modules {bad}: no promotion record in {promotions_path} "
+                                 f"(research protocol §11); remove them from allowed_modules or complete the protocol")
+        return pol
 
     def save(self, path: str | Path) -> Path:
         p = Path(path)
