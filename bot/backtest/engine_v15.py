@@ -12,7 +12,6 @@ No lookahead: a fill may only use bars strictly after the decision bar (SimBroke
 from __future__ import annotations
 
 import logging
-import random
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Any, Callable
@@ -31,6 +30,7 @@ from bot.data.sessions import SessionCalendar
 from bot.execution.oms import OrderManager
 from bot.features.engine import FeatureEngine
 from bot.portfolio.allocator import Allocator, PositionView
+from bot.portfolio.dispatch import KIND_EVENTS, KIND_ORDER, StressHooks, collect_intents, dispatch_intents, recent_sessions  # noqa: F401
 from bot.risk.policy_engine import RiskEngine
 from bot.strategies.adapter import LegacyStrategyAdapter
 from bot.strategies.adapter import PositionView as SlicePos
@@ -222,13 +222,6 @@ def run_daily_legacy(strategy_factory: Callable[[], Strategy], data: dict[str, p
     return res
 
 
-def _pos(risk: RiskEngine, module_id: str, symbol: str, prices: dict[str, float], equity: float) -> SlicePos:
-    sl = risk.ledger.slice(module_id, symbol)
-    px = prices.get(symbol, sl.avg_price)
-    w = (sl.qty * px / equity) if (equity > 0 and px) else None
-    return SlicePos(sl.qty, avg_price=sl.avg_price if abs(sl.qty) > 1e-12 else None, weight=w)
-
-
 def _slice_has_open_order(oms: OrderManager, m: str, s: str) -> bool:
     return any(o.module_id == m and o.symbol == s and o.is_open for o in oms.orders.values())
 
@@ -241,8 +234,6 @@ def _loc(ts, like) -> pd.Timestamp:
 
 
 # =============================================================================================== V1.5 modules
-KIND_ORDER = ("pre_open", "session_open", "bar_close_1m", "bar_close_30m", "t1530", "t1550", "t1558", "session_close")
-KIND_EVENTS = {"bar_close_1m": ("bar_close", "1m"), "bar_close_30m": ("bar_close", "30m")}
 
 
 class Module:
@@ -277,13 +268,6 @@ class MinuteRunConfig:
     throttle: bool = True                               # research protocol runs set False: evaluate the rule, not the throttle
 
 
-def _pos(risk: RiskEngine, module_id: str, symbol: str, prices: dict[str, float], equity: float) -> SlicePos:
-    sl = risk.ledger.slice(module_id, symbol)
-    px = prices.get(symbol, sl.avg_price)
-    w = (sl.qty * px / equity) if (equity > 0 and px) else None
-    return SlicePos(sl.qty, avg_price=sl.avg_price if abs(sl.qty) > 1e-12 else None, weight=w)
-
-
 class _Core:
     """Shared machinery of the minute and daily drivers: broker, risk, features, allocator, OMS, trade bookkeeping,
     per-kind dispatch, attribution and the kill switch. Both drivers only differ in how they walk the session."""
@@ -299,8 +283,7 @@ class _Core:
         self.allocator = Allocator(policy, sectors=cfg.sectors, whole_share_capable=cfg.whole_share_capable)
         self.oms = OrderManager(self.broker, self.risk, policy, run_id=cfg.run_id, clock=lambda: self.broker.now,
                                 whole_share_capable=cfg.whole_share_capable, symbol_kind=lambda s: cfg.symbol_kinds.get(s, "etf"))
-        self.rng = random.Random(cfg.fills.seed)
-        self.delay_queue: list[tuple[int, TradeIntent]] = []
+        self.stress = StressHooks(cfg.fills.drop_signal_fraction, cfg.fills.execution_delay_bars, cfg.fills.seed)
         self.lots: dict[tuple[str, str], dict[str, Any]] = {}
         self.trades: list[Trade] = []
         self.module_trades: dict[str, list[Trade]] = {m.module_id: [] for m in modules}
@@ -354,65 +337,15 @@ class _Core:
 
     # --------------------------------------------------------------- dispatch
     def dispatch(self, ts: datetime, session: date, kinds: set[str]) -> None:
-        """Deliver one ScheduleEvent per (module, listened kind) in KIND_ORDER; modules see kinds, never raw bars."""
-        cfg, risk, oms, prices = self.cfg, self.risk, self.oms, self.prices
+        """Shared decision step (bot.portfolio.dispatch): modules -> admit -> allocate -> orders, plus backtest stresses."""
         acct = self.broker.get_account()
-        new_intents: list[TradeIntent] = []
-        for mod in self.modules:
-            hit = [k for k in KIND_ORDER if k in kinds and k in mod.listens]
-            if not hit:
-                continue
-            if hasattr(mod, "on_event_batch"):
-                syms = [x for x in mod.symbols if x in self.symbols]
-                snaps = {x: self.features.snapshot(x, ts) for x in syms}
-                poss = {x: _pos(risk, mod.module_id, x, prices, acct.equity) for x in syms}
-                for k in hit:
-                    kind, tf = KIND_EVENTS.get(k, (k, None))
-                    new_intents.extend(mod.on_event_batch(ScheduleEvent(kind, ts, session, tf), snaps, poss))
-                continue
-            for sym in mod.symbols:
-                if sym not in self.symbols:
-                    continue
-                snap = self.features.snapshot(sym, ts)
-                for k in hit:
-                    kind, tf = KIND_EVENTS.get(k, (k, None))
-                    new_intents.extend(mod.on_event(ScheduleEvent(kind, ts, session, tf), snap, _pos(risk, mod.module_id, sym, prices, acct.equity)))
-        if cfg.fills.drop_signal_fraction > 0:
-            kept = []
-            for it in new_intents:
-                if it.direction != 0 and self.rng.random() < cfg.fills.drop_signal_fraction:
-                    oms.decisions.append({"ts": ts.isoformat(), "module": it.module_id, "symbol": it.symbol, "decision": "dropped(stress)", "detail": ""})
-                else:
-                    kept.append(it)
-            new_intents = kept
-        if cfg.fills.execution_delay_bars > 0:
-            self.delay_queue.extend((cfg.fills.execution_delay_bars, it) for it in new_intents)
-            new_intents = []
-        ready = []
-        for i in range(len(self.delay_queue) - 1, -1, -1):
-            n, it = self.delay_queue[i]
-            if n <= 0:
-                ready.append(it); self.delay_queue.pop(i)
-            else:
-                self.delay_queue[i] = (n - 1, it)
-        new_intents.extend(reversed(ready))
-        if not new_intents:
+        intents = collect_intents(self.modules, kinds=kinds, ts=ts, session=session, symbols=self.symbols, features=self.features, risk=self.risk,
+                                  prices=self.prices, equity=acct.equity)
+        intents = self.stress.apply(intents, ts, self.oms.decisions)
+        if not intents:
             return
-        admitted = []
-        recent = [x.date for x in self.calendar.sessions_between(session - timedelta(days=9), session)]
-        for it in new_intents:
-            d = risk.admit(it, spread_bps=self.spreads.get(it.symbol), stale_seconds=self.stale.get(it.symbol),
-                           is_etf=cfg.symbol_kinds.get(it.symbol, "etf") == "etf", account=acct, recent_sessions=recent)
-            if d.approved:
-                mult = risk.budget_multiplier(it.module_id)
-                admitted.append(it if mult >= 1.0 else TradeIntent(**{**it.__dict__, "risk_budget_pct": it.risk_budget_pct * mult}))
-            else:
-                oms.decisions.append({"ts": ts.isoformat(), "module": it.module_id, "symbol": it.symbol, "decision": "not_admitted", "detail": f"{d.code}: {d.detail}"})
-        if not admitted:
-            return
-        views = [PositionView(x.symbol, x.module_id, x.qty, prices.get(x.symbol, x.avg_price)) for x in risk.ledger.slices.values() if abs(x.qty) > 1e-12]
-        alloc = self.allocator.allocate(admitted, views, acct.equity, cash=acct.cash)
-        oms.reconcile(alloc.targets, account=acct, prices=prices, session=session, market_open=True, spreads=self.spreads, stale=self.stale)
+        dispatch_intents(intents, ts=ts, session=session, account=acct, risk=self.risk, allocator=self.allocator, oms=self.oms, prices=self.prices,
+                         spreads=self.spreads, stale=self.stale, symbol_kinds=self.cfg.symbol_kinds, recent_sessions=recent_sessions(self.calendar, session))
 
     # ------------------------------------------------------------ attribution
     def before_open(self) -> tuple[dict, dict, dict]:

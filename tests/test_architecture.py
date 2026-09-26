@@ -94,3 +94,17 @@ def test_policy_files_are_frozen_and_live_is_stricter_than_paper():
     assert live.max_daily_loss_pct <= paper.max_daily_loss_pct and not live.allow_short and not live.allow_margin
     assert set(live.allowed_modules) <= set(paper.allowed_modules) and live.allowed_symbols
     assert paper.model_config.get("frozen") is True
+
+
+def test_watchdog_and_streams_cannot_import_strategies_or_research():
+    for f in modules("runtime") + modules("stream"):
+        imps = imports_of(f)
+        if f.name == "daemon.py":
+            bad = [i for i in imps if i.startswith(("bot.research", "bot.advisor"))]
+        else:
+            bad = [i for i in imps if i.startswith(("bot.strategies", "bot.research", "bot.advisor"))]
+        assert not bad, f"{f.relative_to(ROOT)} imports {bad}"
+    wd = imports_of(ROOT / "runtime" / "watchdog.py")
+    assert not [i for i in wd if i.startswith(("bot.strategies", "bot.portfolio", "bot.execution.oms", "bot.features"))]
+    for f in modules("stream"):
+        assert not [i for i in imports_of(f) if i.startswith("bot.execution")], f"{f.relative_to(ROOT)} must not reach the order path"

@@ -224,3 +224,25 @@ and `restore()`; `bot/execution/reconcile.py`; `bot/execution/gates.py`; interlo
 Baselines after Phase 4: `python -m bot backtest --strategy ma_crossover --symbol SP500 --start 2000-01-03 --end 2022-12-28 --no-save`
 re-run, +95.72%, Sharpe 0.51, 26 trades, walk-forward +53.00%, Sharpe 0.55, 56 trades (§2.3). `engine.py` and both baseline
 strategies unchanged; `FakeBroker.submit_market_order` now runs the shared validator (same rules as before plus the OPG/CLS window).
+
+## 9. Phase 5 record (runtime)
+
+Built: `bot/core/bus.py`, `bot/portfolio/dispatch.py` (the one decision step shared by the backtester and the daemon),
+`bot/stream/marketdata.py` (one connection, dedup, order, staleness, 406 fatal, reconnect backfill SIP-then-IEX, 30m
+aggregation, quote subscriptions follow positions), `bot/stream/tradeupdates.py` (host-verified per env, event parsing,
+watermark, reconnect → reconcile), `bot/runtime/scheduler.py` (close-relative marks, idempotent, no morning replay on a
+midday start), `bot/runtime/daemon.py` (boot gates, reconcile, cycles, halt flag, kill switch, alerts, daily summary,
+graceful shutdown, restart safety), `bot/runtime/watchdog.py` + `config/watchdog.yaml`, `deploy/systemd/*.service`,
+`deploy/README.md`, CLI `run`, `watchdog`; `review` extended with the store section. `reconcile` now also resolves
+rows committed as `submitting` that never reached the broker.
+
+| # | Item | Decision |
+|---|---|---|
+| D25 | Streaming verification | The sockets are alpaca-py's `StockDataStream`/`TradingStream` (auth, msgpack, reconnect with backoff are the SDK's); the hub and client wrap them through two hooks (`_start_ws`, `close`, `_dispatch` for error frames) and everything above the socket is tested offline. Real reconnects, the 406 frame and binary paper frames remain unverified here (D3) and are the first things `python -m bot run --env paper` on the operator's machine will show. |
+| D26 | Where staleness comes from | The daemon measures freshness from the last 1-minute bar it processed itself (bus), falling back to the hub; symbols without a measurement are "unknown" (admission passes, the RiskManager gate still requires a current bar). |
+| D27 | Watchdog actions | `restart_daemon` from the gate list is systemd's job (`Restart=on-failure`), not the watchdog's; the gate counts the four configured actions (alert, halt_entries, cancel_pending_entries, flatten). |
+| D28 | Legacy strategies in the daemon | `ma_crossover`/`mean_reversion` stay on `python -m bot trade` (the V1 loop, unchanged); the daemon runs V1.5 modules only. Running both processes on one account is not supported (one market-data connection, one ledger). |
+
+Baselines after Phase 5: `python -m bot backtest --strategy ma_crossover --symbol SP500 --start 2000-01-03 --end 2022-12-28 --no-save`
+re-run, +95.72%, Sharpe 0.51, 26 trades, walk-forward +53.00%, Sharpe 0.55, 56 trades (§2.3). `engine.py` and both
+baseline strategies unchanged; the minute engine's outputs are unchanged by the dispatch extraction (its tests are the check).

@@ -1,0 +1,25 @@
+[Unit]
+Description=tbot V1.5 trading daemon (paper)
+After=network-online.target chrony.service
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tbot
+Group=tbot
+WorkingDirectory=/opt/tbot
+EnvironmentFile=/etc/tbot/env
+ExecStart=/opt/tbot/.venv/bin/python -m bot run --env paper
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/tbot/state /opt/tbot/logs /opt/tbot/data_cache /opt/tbot/reports /opt/tbot/research
+
+[Install]
+WantedBy=multi-user.target

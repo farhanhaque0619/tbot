@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     state_dir: Path = Path("state")
     paper_policy_path: Path = Path("config/policy.paper.yaml")
     live_policy_path: Path = Path("config/policy.live.yaml")
+    whole_share_min_equity: float = Field(default=5000.0, ge=0)   # below this the daemon runs the fractional paths (DAY only, no auctions)
 
     # --- Research-only feature flags (never affect execution) ---------------------------------
     enable_jev: bool = False

@@ -6,7 +6,7 @@ from datetime import date
 from statistics import mean
 from typing import Any
 
-WATCHDOG_ACTIONS = ("restart_daemon", "halt_entries", "flatten_all", "alert_operator")
+WATCHDOG_ACTIONS = ("alert", "halt_entries", "cancel_pending_entries", "flatten")
 
 
 @dataclass(frozen=True)

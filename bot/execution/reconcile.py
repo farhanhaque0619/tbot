@@ -132,6 +132,26 @@ def reconcile(*, broker, oms: OrderManager, policy, prices: dict[str, float], se
                 disc("unknown_order_canceled", symbol=o.symbol, client_order_id=o.client_order_id, detail=f"{o.side} {o.qty:g} {o.order_type} canceled")
             except Exception as e:  # noqa: BLE001
                 disc("unknown_order_cancel_failed", symbol=o.symbol, client_order_id=o.client_order_id, detail=str(e))
+    # ---- 3b. rows committed as 'submitting' before a broker call that never completed (crash / SIGKILL mid-submission)
+    for rec in list(oms.orders.values()):
+        if rec.status != "submitting" or rec.broker_id:
+            continue
+        found = None
+        try:
+            found = broker.get_order_by_client_id(rec.client_order_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("lookup of %s failed: %s", rec.client_order_id, e)
+        if found is not None:
+            rec.broker_id, rec.status = found.id, found.status
+            oms.by_broker_id[found.id] = rec
+            disc("submitting_order_found_at_broker", symbol=rec.symbol, client_order_id=rec.client_order_id, detail="resolved: broker id attached")
+        else:
+            rec.status = "submit_failed"
+            rec.events.append("lost: never reached the broker (crash mid-submission)")
+            ledger.inflight.pop(rec.client_order_id, None)
+            disc("submitting_order_lost", symbol=rec.symbol, client_order_id=rec.client_order_id, detail="marked submit_failed; slice free again")
+        if store is not None:
+            store.update_order(rec)
     # ---- 4. streak of unresolved discrepancies -> halt entries
     unresolved = [d for d in rep.discrepancies if d["kind"] in ("position_mismatch", "orphan_flatten_failed", "unknown_order_cancel_failed", "position_missing_at_broker")]
     streak = int((store.meta(consecutive_key) if store is not None else None) or oms.__dict__.get("_reconcile_streak", 0) or 0)

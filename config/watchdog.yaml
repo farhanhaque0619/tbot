@@ -1,0 +1,31 @@
+# Watchdog configuration (spec §12). The watchdog runs as its own process/systemd unit with read-only broker access
+# plus cancel/close permissions. Actions are taken ONLY when listed under `actions`, in escalation order.
+interval_seconds: 30
+env: paper                        # which daemon store to watch: state/<env>.sqlite
+thresholds:
+  heartbeat_stale_seconds: 120    # daemon heartbeat older than this -> alert
+  heartbeat_dead_seconds: 300     # -> halt entries (and flatten if listed under flatten_on)
+  feed_stale_seconds: 180         # no market-data bar during regular hours
+  trade_updates_stale_seconds: 600
+  broker_unreachable_seconds: 120
+  daily_loss_pct: 0.03            # of day-start equity, from the broker account (independent of the daemon)
+  drawdown_pct: 0.20              # from the store's peak equity
+actions:                          # escalation order; remove an entry to disable that action
+  - alert
+  - halt_entries
+  - cancel_pending_entries
+  - flatten
+flatten_on:                       # conditions allowed to trigger the flatten action (never protective legs, except by flattening)
+  - heartbeat_stale_300s
+  - drawdown_breach
+halt_on:
+  - heartbeat_stale
+  - feed_stale
+  - trade_updates_stale
+  - broker_unreachable
+  - position_mismatch
+  - daily_loss_breach
+  - drawdown_breach
+  - orphaned_orders
+alert_on:
+  - unprotected_overnight

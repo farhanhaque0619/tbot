@@ -534,6 +534,78 @@ def _calendar(settings: Settings, store, broker=None):
     return cal
 
 
+def cmd_run(args) -> int:
+    """V1.5 daemon. Paper unless --env live (which also needs --live, TRADING_ENV=live, LIVE_AUTONOMOUS_TRADING=true, an arm)."""
+    from bot.monitoring.alerts import Alerter
+    from bot.runtime.daemon import Daemon, DaemonRefused
+    from bot.stream.marketdata import MarketDataHub, make_stream_factory
+    from bot.stream.tradeupdates import TradeUpdatesClient, make_trading_stream_factory
+
+    settings = get_settings()
+    env = args.env
+    if env == "live":
+        env = _env_from_args(args, settings)      # --live and TRADING_ENV=live, or refuse
+        if env != "live":
+            raise SystemExit("--env live needs --live")
+    _print_banner(env)
+    bar_store, _loader = _make_loader(settings, env, need_provider=True)
+    from bot.data.providers import AlpacaBarProvider
+    provider = AlpacaBarProvider(settings, env=env) if settings.has_credentials(env) else None
+    from bot.core.bus import EventBus
+    bus = EventBus()
+    alerter = Alerter(settings.discord_webhook_url.get_secret_value())
+    d = Daemon(settings, env=env, policy_path=args.policy, cli_live_flag=bool(getattr(args, "live", False)), run_id=args.run_id or env,
+               bar_store=bar_store, provider=provider, alerter=alerter, bus=bus)
+    try:
+        d.boot()
+    except DaemonRefused as e:
+        console.print(f"[bold red]REFUSED: {e}[/bold red]")
+        return 3
+    feed = "sip" if settings.data_plan == "plus" else "iex"
+    d.hub = MarketDataHub(symbols=d.symbols, calendar=d.calendar, bus=bus, feed=feed, stream_factory=make_stream_factory(settings, env, feed), provider=provider,
+                          alert=lambda t, m, level="info": d.alert(t, m, level), store=d.store)
+    d.tu = TradeUpdatesClient(env=env, bus=bus, stream_factory=make_trading_stream_factory(settings, env), store=d.store,
+                              alert=lambda t, m, level="info": d.alert(t, m, level))
+    console.print(f"[bold]{env.upper()} daemon[/bold] policy {d.policy_path} {d.policy.fingerprint()[:16]}… modules {[m.module_id for m in d.modules]} symbols {d.symbols} feed {feed}")
+    if args.once:
+        n = d.cycle()
+        d.shutdown()
+        console.print(f"one cycle: {n} events handled; state persisted")
+        return 0
+    return d.run()
+
+
+def cmd_watchdog(args) -> int:
+    from bot.data.sessions import SessionCalendar
+    from bot.execution.store import ExecutionStore
+    from bot.monitoring.alerts import Alerter
+    from bot.runtime.watchdog import Watchdog, load_config
+
+    settings = get_settings()
+    cfg = load_config(args.config)
+    env = args.env or cfg.get("env", "paper")
+    if env == "live":
+        env = _env_from_args(args, settings)
+    store = ExecutionStore(settings.state_dir / f"{args.run_id or env}.sqlite")
+    broker = _broker(settings, env)
+    ok, why = broker.verify_account_env()
+    if not ok:
+        raise SystemExit(f"REFUSING: {why}")
+    alerter = Alerter(settings.discord_webhook_url.get_secret_value())
+    wd = Watchdog(cfg, broker=broker, store=store, calendar=SessionCalendar(), halt_flag_path=settings.state_dir / f"{args.run_id or env}.halt",
+                  alert=lambda t, m, level="warning": alerter.send(f"[{env.upper()} WATCHDOG] {t}", m, level=level))
+    console.print(f"watchdog on {env} · actions enabled: {wd.enabled} · flatten_on: {cfg.get('flatten_on')} · every {cfg.get('interval_seconds')}s")
+    if args.once:
+        rep = wd.check()
+        acts = wd.act(rep)
+        for f in rep.findings:
+            console.print(f"[{'red' if f.severity == 'critical' else 'yellow'}]{f.condition}[/]: {f.detail}")
+        console.print("clean" if rep.clean else f"actions: {acts}")
+        return 0 if rep.clean else 1
+    wd.run_forever()
+    return 0
+
+
 def cmd_state(args) -> int:
     from bot.execution.store import ExecutionStore
     settings = get_settings()
@@ -789,6 +861,22 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "unthrottle":
             x.add_argument("--module", required=True, help="module id whose halved risk budget is restored, e.g. M2")
     r.set_defaults(fn=cmd_risk)
+
+    rn = sub.add_parser("run", help="V1.5 autonomous daemon (paper by default; --env live needs --live, TRADING_ENV=live, LIVE_AUTONOMOUS_TRADING=true and an arm)")
+    rn.add_argument("--env", choices=["paper", "live"], default="paper")
+    rn.add_argument("--live", action="store_true", help="required with --env live")
+    rn.add_argument("--policy", default=None, help="policy file (default: config/policy.<env>.yaml)")
+    rn.add_argument("--run-id", default=None)
+    rn.add_argument("--once", action="store_true", help="boot, reconcile, run one cycle, persist and exit (no streams)")
+    rn.set_defaults(fn=cmd_run)
+
+    wd = sub.add_parser("watchdog", help="independent watchdog process (read-only broker access plus cancel/close; actions per config/watchdog.yaml)")
+    wd.add_argument("--config", default="config/watchdog.yaml")
+    wd.add_argument("--env", choices=["paper", "live"], default=None)
+    wd.add_argument("--live", action="store_true")
+    wd.add_argument("--run-id", default=None)
+    wd.add_argument("--once", action="store_true")
+    wd.set_defaults(fn=cmd_watchdog)
 
     stp = sub.add_parser("state", help="V1.5 execution store: migrate the V1 JSON state, show a summary")
     sts = stp.add_subparsers(dest="state_cmd", required=True)

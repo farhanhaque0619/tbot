@@ -75,6 +75,8 @@ def build_review(settings: Settings, run_id: str = "paper") -> str:
     if shadow:
         L += ["", "## Advisor shadow mode", "", f"{len(shadow)} advice records. Run `python -m bot research regimes` with the shadow file to compute calibration; "
               "no threshold is trusted until n is large and buckets separate."]
+    # --- V1.5 execution store (daemon runs)
+    L += v15_section(settings, run_id)
     # --- proposals
     L += ["", "## Proposals (require operator review; nothing was changed)", ""]
     props = []
@@ -98,3 +100,47 @@ def write_review(settings: Settings, run_id: str = "paper", out_dir: Path = Path
     p = out_dir / f"review_{run_id}_{datetime.now():%Y%m%d_%H%M}.md"
     p.write_text(build_review(settings, run_id), encoding="utf-8")
     return p
+
+
+def v15_section(settings: Settings, run_id: str) -> list[str]:
+    """Per-module expectancy, slippage vs assumption, attribution, throttles, unprotected positions from state/<run_id>.sqlite."""
+    db = settings.state_dir / f"{run_id}.sqlite"
+    if not db.exists():
+        return []
+    from bot.execution.store import ExecutionStore
+    es = ExecutionStore(db)
+    L = ["", f"## V1.5 daemon store (`{db}`)", ""]
+    trades = es.trades()
+    by_mod: dict[str, list[float]] = {}
+    for t in trades:
+        by_mod.setdefault(t["module"], []).append(float(t["pnl"] or 0.0))
+    if by_mod:
+        L += ["| module | trades | expectancy/trade | win rate | net |", "|---|---|---|---|---|"]
+        for m, p in sorted(by_mod.items()):
+            L.append(f"| {m} | {len(p)} | {mean(p):+.2f} | {sum(x > 0 for x in p) / len(p):.0%} | {sum(p):+.2f} |")
+    else:
+        L.append("no closed trades in the store yet")
+    ref = {o["client_order_id"]: (o["reference_price"], o["side"], o["module"]) for o in es.orders() if o.get("reference_price")}
+    slips: dict[str, list[float]] = {}
+    for f in es.fills():
+        if f["event"] in ("fill", "partial_fill") and f.get("price") and f["client_order_id"] in ref and ref[f["client_order_id"]][0]:
+            rp, side, m = ref[f["client_order_id"]]
+            slips.setdefault(m, []).append((f["price"] - rp) / rp * 1e4 * (1 if side == "buy" else -1))
+    expected = settings.slippage_bps + settings.spread_bps / 2
+    if slips:
+        L += ["", f"realised slippage vs reference (backtest assumption {expected:.1f} bps per side):"]
+        L += [f"- {m}: mean {mean(v):+.1f} bps over {len(v)} fills" + (" ← exceeds the assumption by more than 3 bps" if mean(v) - expected > 3 else "") for m, v in sorted(slips.items())]
+    thr = es.throttles()
+    L += ["", "throttles: " + (", ".join(f"{m} x{x:.2f} ({r})" for m, (x, r) in thr.items()) if thr else "none")]
+    unp = [p for p in es.positions() if p.get("unprotected") or p.get("unprotected_overnight")]
+    L += ["unprotected positions: " + (", ".join(f"{p['symbol']}({p['module']}{', overnight' if p.get('unprotected_overnight') else ''})" for p in unp) if unp else "none")]
+    orphans = [p for p in es.positions() if p["module"] == "orphan"]
+    if orphans:
+        L.append("orphan positions adopted by reconciliation: " + ", ".join(f"{p['symbol']} {p['qty']:g}" for p in orphans))
+    recon = es.decisions(kind="reconciliation", limit=50)
+    L.append(f"reconciliation records (last 50): {len(recon)}" + (f"; latest: {recon[0].get('kind')} {recon[0].get('symbol', '')}" if recon else ""))
+    wd = [c for c in es.heartbeats() if c.startswith("watchdog:")]
+    L.append("watchdog actions ever taken: " + (", ".join(sorted(c.split(':', 1)[1] for c in wd)) if wd else "none"))
+    hb = es.heartbeats().get("daemon")
+    L.append(f"daemon heartbeat: {hb[0]} ({hb[1]})" if hb else "daemon heartbeat: never")
+    return L

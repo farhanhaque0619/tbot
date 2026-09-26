@@ -28,7 +28,7 @@ def test_paper_gates_with_populated_store(tmp_path):
     base = datetime(2026, 1, 5, 16, tzinfo=timezone.utc)
     for i in range(61):
         st.heartbeat("daemon_session", base + timedelta(days=i), "ok")
-    for a in ("restart_daemon", "halt_entries", "flatten_all", "alert_operator"):
+    for a in ("alert", "halt_entries", "cancel_pending_entries", "flatten"):
         st.heartbeat(f"watchdog:{a}", base, "exercised")
     from bot.execution.oms import OrderRecord
     rec = OrderRecord("c1", "M2", "SPY", "buy", 10, "entry", "marketable_limit", date(2026, 1, 5), base, 100.0, broker_id="b1", status="filled", filled_qty=10, avg_price=100.03)

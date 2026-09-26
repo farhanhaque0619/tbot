@@ -153,3 +153,11 @@ eligible time when `require_broker_protection_overnight` is true. An exit or fla
 V1 JSON file once; `state show` summarises; `risk unthrottle --module M2` is the only way to restore a halved budget.
 `python -m bot gates` prints the paper→live candidate gates from the store; `gates --live` the step-up gates. Both are
 read-only.
+
+**Daemon and watchdog (Phase 5).** `python -m bot run --env paper` is the autonomous runtime (systemd unit
+`deploy/systemd/tbot.service`); `python -m bot watchdog` runs beside it (`tbot-watchdog.service`) and may only do what
+`config/watchdog.yaml` lists, in escalation order: alert → halt entries (flag file `state/<run-id>.halt`, honoured by
+the daemon at the next decision) → cancel pending entries → flatten on `flatten_on` conditions. The watchdog never
+cancels a protective stop except by flattening. `--env live` needs `--live`, `TRADING_ENV=live`,
+`LIVE_AUTONOMOUS_TRADING=true`, an arm with the current policy fingerprint and a promotion record for every module.
+`python -m bot run --once` boots, reconciles, runs one cycle without streams and exits. Every restart disarms live.
