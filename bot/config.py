@@ -74,6 +74,8 @@ class Settings(BaseSettings):
     order_time_in_force: Literal["opg", "day"] = "opg"
     poll_interval_seconds: int = Field(default=300, ge=5)
     state_dir: Path = Path("state")
+    paper_policy_path: Path = Path("config/policy.paper.yaml")
+    live_policy_path: Path = Path("config/policy.live.yaml")
 
     # --- Research-only feature flags (never affect execution) ---------------------------------
     enable_jev: bool = False

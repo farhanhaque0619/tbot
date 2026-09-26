@@ -57,8 +57,9 @@ class OrderRecord:
 class OrderManager:
     def __init__(self, broker, risk: RiskEngine, policy: RiskPolicy, *, run_id: str, clock: Callable[[], datetime],
                  whole_share_capable: bool = False, on_alert: Callable[[str, str], None] | None = None,
-                 software_stops: bool = False, symbol_kind: Callable[[str], str] | None = None):
+                 software_stops: bool = False, symbol_kind: Callable[[str], str] | None = None, store=None):
         self.broker, self.risk, self.policy, self.run_id, self.clock = broker, risk, policy, run_id, clock
+        self.store = store                        # ExecutionStore or None (backtests)
         self.whole = whole_share_capable
         self.alert = on_alert or (lambda title, msg: None)
         self.software_stops = software_stops      # legacy daily mode: stop checked on the close by the engine, no broker leg
@@ -71,6 +72,42 @@ class OrderManager:
         self.trades: list[dict[str, Any]] = []
         self.decisions: list[dict[str, Any]] = []
         self.protective: dict[tuple[str, str], str] = {}       # (module, symbol) -> client id of live protective order
+        if store is not None:
+            self.seen_events = set(store.seen_events())
+
+    # ------------------------------------------------------------ persistence
+    def _persist(self, rec: OrderRecord) -> None:
+        if self.store is not None:
+            self.store.update_order(rec)
+
+    def restore(self) -> int:
+        """Rebuild orders, slices and protective map from the store after a restart. Returns the number of orders."""
+        if self.store is None:
+            return 0
+        n = 0
+        for row in self.store.orders():
+            rec = OrderRecord(row["client_order_id"], row["module"], row["symbol"], row["side"], float(row["qty"]), row["kind"], row["style"],
+                              date.fromisoformat(row["session"]) if row["session"] else self.clock().date(),
+                              datetime.fromisoformat(row["decision_ts"]) if row["decision_ts"] else self.clock(), float(row["reference_price"] or 0.0),
+                              broker_id=row["broker_id"], status=row["status"], filled_qty=float(row["filled_qty"] or 0), avg_price=row["avg_price"],
+                              protective_for=row["protective_for"], repriced=bool(row["repriced"]),
+                              abandon_at=datetime.fromisoformat(row["abandon_at"]) if row["abandon_at"] else None, limit_price=row["limit_price"],
+                              stop_price=row["stop_price"], tif=row["tif"] or "day", events=list(row["events"] or []), risk=row["risk"])
+            self.orders[rec.client_order_id] = rec
+            if rec.broker_id:
+                self.by_broker_id[rec.broker_id] = rec
+            key = (rec.module_id, rec.symbol, rec.session)
+            try:
+                seq = int(rec.client_order_id.rsplit("-", 2)[1])
+                self._seq[key] = max(self._seq.get(key, 0), seq)
+            except (ValueError, IndexError):
+                pass
+            n += 1
+        self.store.load_slices(self.risk.ledger)
+        for (m, s), p in self.store.protectives().items():
+            if p["client_order_id"] in self.orders and self.orders[p["client_order_id"]].is_open:
+                self.protective[(m, s)] = p["client_order_id"]
+        return n
 
     # ------------------------------------------------------------------ ids
     def _cid(self, module: str, symbol: str, session: date, kind: str) -> str:
@@ -129,17 +166,21 @@ class OrderManager:
             if not dec.approved:
                 rec.status = "risk_rejected"
                 self.orders[cid] = rec
+                self._persist(rec)
                 self._decide(t, rec, "blocked", f"{dec.code}: {dec.detail}")
                 created.append(rec)
                 continue
             self.orders[cid] = rec
             self.risk.ledger.inflight[cid] = (t.module_id, t.symbol, (1 if side == "buy" else -1) * qty * intent.reference_price)
             protective = t.protective_stop_price if (kind == "entry" and t.overnight_ok and not self.software_stops) else None
+            if self.store is not None:
+                self.store.begin_submit(rec)          # committed BEFORE the broker call (crash-safe: cid is deterministic)
             try:
                 info = self._submit(rec, order_type, limit_price, protective, whole=self._is_whole(qty))
             except Exception as e:  # noqa: BLE001
                 rec.status, rec.events = "submit_failed", rec.events + [f"submit failed: {type(e).__name__}: {e}"]
                 self.risk.ledger.inflight.pop(cid, None)
+                self._persist(rec)
                 self._decide(t, rec, "error", str(e))
                 created.append(rec)
                 continue
@@ -150,6 +191,7 @@ class OrderManager:
             rec.abandon_at = self._abandon_at(style, now, session)
             rec.stop_price = protective if protective is not None else (t.protective_stop_price if kind == "entry" else None)
             self.by_broker_id[info.id] = rec
+            self._persist(rec)
             self._decide(t, rec, "submit", f"{side} {qty:g} {style} {tif}")
             created.append(rec)
         return created
@@ -221,15 +263,27 @@ class OrderManager:
         return MarketState(**{f: vals.get(f, float("nan")) for f in fields})
 
     def _decide(self, t: TargetPosition, rec: OrderRecord | None, decision: str, detail: str) -> None:
-        self.decisions.append({"ts": self.clock().isoformat(), "module": t.module_id, "symbol": t.symbol, "target_qty": t.target_qty,
-                               "decision": decision, "detail": detail, "client_order_id": rec.client_order_id if rec else None,
-                               "risk": rec.risk if rec else None})
+        d = {"ts": self.clock().isoformat(), "module": t.module_id, "symbol": t.symbol, "target_qty": t.target_qty,
+             "decision": decision, "detail": detail, "client_order_id": rec.client_order_id if rec else None, "risk": rec.risk if rec else None}
+        self.decisions.append(d)
+        if self.store is not None:
+            self.store.add_decision(d)
 
     # -------------------------------------------------------- trade updates
     def on_trade_update(self, ev: TradeUpdateEvent, *, session: date | None = None) -> None:
         if ev.key in self.seen_events:
             return
         self.seen_events.add(ev.key)
+        if self.store is not None and not self.store.record_fill(ev):
+            return                                   # already applied before a restart
+        self._on_trade_update(ev, session=session)
+        if self.store is not None:
+            rec = self.orders.get(ev.client_order_id) or self.by_broker_id.get(ev.order_id)
+            if rec is not None:
+                self.store.update_order(rec)
+            self.store.save_slices(self.risk.ledger)
+
+    def _on_trade_update(self, ev: TradeUpdateEvent, *, session: date | None = None) -> None:
         rec = self.orders.get(ev.client_order_id) or self.by_broker_id.get(ev.order_id)
         if rec is None:
             if ev.client_order_id.endswith("-stop") or ev.client_order_id.endswith("-tp"):
@@ -318,6 +372,9 @@ class OrderManager:
         self.protective[(module_id, symbol)] = cid
         sl.protective_order_id, sl.unprotected = cid, False
         sl.unprotected_overnight = not whole
+        self._persist(rec)
+        if self.store is not None:
+            self.store.set_protective(module_id, symbol, cid, stop_price, tif)
         if old and old in self.orders and self.orders[old].is_open and self.orders[old].broker_id:
             try:
                 self.broker.cancel_order(self.orders[old].broker_id)
@@ -440,9 +497,14 @@ class OrderManager:
         entry = self._entry_price_for(rec)
         side = 1 if rec.side == "sell" else -1
         pnl = side * (px - entry) * qty if entry is not None else 0.0
-        self.trades.append({"module": rec.module_id, "symbol": rec.symbol, "qty": qty, "entry_price": entry, "exit_price": px, "pnl": pnl,
-                            "exit_reason": rec.kind, "exit_ts": self.clock(), "session": session})
-        self.risk.record_trade_pnl(rec.module_id, pnl)
+        t = {"module": rec.module_id, "symbol": rec.symbol, "qty": qty, "entry_price": entry, "exit_price": px, "pnl": pnl,
+             "exit_reason": rec.kind, "exit_ts": self.clock(), "session": session}
+        self.trades.append(t)
+        throttled = self.risk.record_trade_pnl(rec.module_id, pnl)
+        if self.store is not None:
+            self.store.add_trade(t)
+            if throttled:
+                self.store.set_throttle(rec.module_id, self.risk.budget_multiplier(rec.module_id), "last 60 trades net negative; risk budget halved")
 
     def _entry_price_for(self, rec: OrderRecord) -> float | None:
         entries = [o for o in self.orders.values() if o.module_id == rec.module_id and o.symbol == rec.symbol and o.kind == "entry" and o.filled_qty > 0]

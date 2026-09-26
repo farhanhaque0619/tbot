@@ -10,7 +10,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date, datetime, timedelta
+from datetime import timezone, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -372,9 +372,22 @@ def _arm_interactive(settings: Settings) -> None:
     else:
         console.print("[bold red]SAFE_LIVE_TEST_MODE is OFF.[/bold red]")
         ack = input("Type ACK-UNSAFE to acknowledge running without safe-mode caps: ").strip() == "ACK-UNSAFE"
+    policy = _live_policy()           # refuses when a module in the live policy has no promotion record (spec §11)
+    console.print(f"live policy {settings.live_policy_path}: modules {list(policy.allowed_modules)}, fingerprint {policy.fingerprint()}")
     typed = input(f"Type exactly: {LIVE_CONFIRMATION_PHRASE}\n> ")
-    st = il.arm(typed_phrase=typed, acknowledged=ack)
-    console.print(f"[bold red]ARMED[/bold red] until {st.expires_at} (UTC). Disarm with `python -m bot live disarm`. Any restart disarms.")
+    st = il.arm(typed_phrase=typed, acknowledged=ack, policy_fingerprint=policy.fingerprint())
+    console.print(f"[bold red]ARMED[/bold red] until {st.expires_at} (UTC) with policy {st.policy_fingerprint[:12]}…. "
+                  f"Disarm with `python -m bot live disarm`. Any restart or policy edit disarms.")
+
+
+def _live_policy():
+    """The live RiskPolicy, loaded with the promotion check. A failure here is a refusal, not an error to work around."""
+    from bot.core.policy import RiskPolicy
+    settings = get_settings()
+    try:
+        return RiskPolicy.load(settings.live_policy_path, require_promotions=True)
+    except ValueError as e:
+        raise SystemExit(f"live policy refused: {e}") from e
 
 
 def cmd_live(args) -> int:
@@ -404,8 +417,16 @@ def cmd_live(args) -> int:
         st = StateStore(settings.state_dir / "live.json").load()
         rm = RiskManager(RiskLimits.from_settings(settings), RiskState.from_dict(st.risk) if st.risk else None,
                          safe=SafeLiveLimits.from_settings(settings) if settings.safe_live_test_mode else None)
+        from bot.core.policy import RiskPolicy
+        try:
+            policy = RiskPolicy.load(settings.live_policy_path)
+            console.print(f"live policy {settings.live_policy_path}: modules {list(policy.allowed_modules)} fingerprint {policy.fingerprint()[:16]}… "
+                          f"unpromoted={policy.unpromoted_modules()}")
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[red]live policy failed to load: {e}[/red]")
+            policy = None
         gates = il.check(cli_live_flag=True, account=account, account_env_ok=env_ok, data_fresh=data_fresh, risk_manager=rm,
-                         risk_last_error=st.last_error)
+                         risk_last_error=st.last_error, policy=policy)
         gt = Table(title="Live interlock gates (all must pass before any live order)", header_style="bold")
         gt.add_column("Gate"); gt.add_column("OK"); gt.add_column("Detail")
         for g in gates:
@@ -477,6 +498,16 @@ def cmd_risk(args) -> int:
     if args.risk_cmd == "show":
         console.print_json(json.dumps({"run_id": args.run_id, "env": state.env, "risk": state.risk or {}, "last_error": state.last_error,
                                        "positions": state.positions, "pending_orders": [c for c, o in state.orders.items() if o.get("status") in ("submitting", "new", "accepted", "partially_filled")]}, default=str))
+    elif args.risk_cmd == "unthrottle":
+        from bot.execution.store import ExecutionStore
+        es = ExecutionStore(settings.state_dir / f"{args.run_id}.sqlite")
+        if not args.module:
+            raise SystemExit("--module required")
+        if es.clear_throttle(args.module):
+            es.add_decision({"ts": datetime.now(timezone.utc).isoformat(), "module": args.module, "decision": "unthrottle", "detail": "operator restored the risk budget"}, kind="operator")
+            console.print(f"{args.module}: throttle cleared (risk budget restored); the daemon picks it up on its next reconcile")
+        else:
+            console.print(f"{args.module}: not throttled")
     elif args.risk_cmd == "reset":
         if not state.risk.get("killed"):
             console.print("kill switch is not active")
@@ -501,6 +532,56 @@ def _calendar(settings: Settings, store, broker=None):
         except Exception as e:  # noqa: BLE001
             console.print(f"[yellow]calendar sync failed ({type(e).__name__}); using cached/rule calendar[/yellow]")
     return cal
+
+
+def cmd_state(args) -> int:
+    from bot.execution.store import ExecutionStore
+    settings = get_settings()
+    db = Path(args.db) if getattr(args, "db", None) else settings.state_dir / f"{args.run_id}.sqlite"
+    es = ExecutionStore(db)
+    if args.state_cmd == "migrate":
+        js = Path(args.json) if args.json else settings.state_dir / f"{args.run_id}.json"
+        if not js.exists():
+            raise SystemExit(f"{js} not found; nothing to migrate")
+        n = es.migrate_from_json(js)
+        console.print(f"migrated {js} -> {db}: {n} (positions are flagged unprotected until the first reconcile; the JSON file is kept for one release)")
+        return 0
+    if args.state_cmd == "show":
+        console.print_json(json.dumps({"db": str(db), "meta": {k: es.meta(k) for k in ("schema_version", "run_id", "env", "policy_fingerprint", "migrated_from", "reconcile_unresolved_streak")},
+                                       "open_orders": [o["client_order_id"] for o in es.orders(open_only=True)], "positions": es.positions(),
+                                       "throttles": es.throttles(), "heartbeats": es.heartbeats(), "risk": es.load_risk(), "trades": len(es.trades())}, default=str))
+        return 0
+    return 1
+
+
+def cmd_gates(args) -> int:
+    from bot.core.policy import RiskPolicy
+    from bot.execution.gates import live_gates, paper_gates, summary
+    from bot.execution.store import ExecutionStore
+    settings = get_settings()
+    if args.live:
+        es = ExecutionStore(settings.state_dir / "live.sqlite")
+        paper_es = ExecutionStore(settings.state_dir / f"{args.run_id}.sqlite")
+        from statistics import mean
+        ref = {o["client_order_id"]: (o["reference_price"], o["side"]) for o in paper_es.orders() if o.get("reference_price")}
+        slips = [(f["price"] - ref[f["client_order_id"]][0]) / ref[f["client_order_id"]][0] * 1e4 * (1 if ref[f["client_order_id"]][1] == "buy" else -1)
+                 for f in paper_es.fills() if f["event"] in ("fill", "partial_fill") and f.get("price") and f["client_order_id"] in ref and ref[f["client_order_id"]][0]]
+        gates = live_gates(es, safe_mode_sessions=0, last_stepup=None, paper_slippage_bps=mean(slips) if slips else None)
+        title = "Live step-up gates (spec §14)"
+    else:
+        es = ExecutionStore(settings.state_dir / f"{args.run_id}.sqlite")
+        policy = RiskPolicy.load(settings.live_policy_path)
+        gates = paper_gates(es, policy, backtest_slippage_bps=args.backtest_slippage_bps, backtest_m2_expectancy_sign=args.m2_backtest_sign)
+        title = "Paper -> live candidate gates (spec §14)"
+    t = Table(title=title, header_style="bold")
+    t.add_column("Gate"); t.add_column("Result"); t.add_column("Detail")
+    for g in gates:
+        colour = {"PASS": "green", "FAIL": "red", "UNKNOWN": "yellow"}[g.label]
+        t.add_row(g.name, f"[{colour}]{g.label}[/{colour}]", g.detail)
+    console.print(t)
+    s = summary(gates)
+    console.print(f"{s['pass']} pass, {s['fail']} fail, {s['unknown']} unknown -> {'ALL PASS' if s['all_pass'] else 'NOT READY'} (read-only; nothing is enabled by this command)")
+    return 0 if s["all_pass"] else 1
 
 
 def cmd_data(args) -> int:
@@ -700,12 +781,28 @@ def build_parser() -> argparse.ArgumentParser:
     db.add_argument("--watch", type=int, default=None, help="refresh every N seconds")
     db.set_defaults(fn=cmd_dashboard)
 
-    r = sub.add_parser("risk", help="inspect / reset risk state")
+    r = sub.add_parser("risk", help="inspect / reset risk state; unthrottle a module (operator action)")
     rs = r.add_subparsers(dest="risk_cmd", required=True)
-    for name in ("show", "reset"):
+    for name in ("show", "reset", "unthrottle"):
         x = rs.add_parser(name)
         x.add_argument("--run-id", default="paper")
+        if name == "unthrottle":
+            x.add_argument("--module", required=True, help="module id whose halved risk budget is restored, e.g. M2")
     r.set_defaults(fn=cmd_risk)
+
+    stp = sub.add_parser("state", help="V1.5 execution store: migrate the V1 JSON state, show a summary")
+    sts = stp.add_subparsers(dest="state_cmd", required=True)
+    mg = sts.add_parser("migrate", help="import state/<run-id>.json into state/<run-id>.sqlite (idempotent; the JSON file is kept)")
+    mg.add_argument("--run-id", default="paper"); mg.add_argument("--json", default=None); mg.add_argument("--db", default=None)
+    sh = sts.add_parser("show"); sh.add_argument("--run-id", default="paper")
+    stp.set_defaults(fn=cmd_state)
+
+    gp = sub.add_parser("gates", help="paper -> live candidate gates and live step-up gates from the execution store (read-only)")
+    gp.add_argument("--run-id", default="paper")
+    gp.add_argument("--live", action="store_true", help="evaluate the live step-up gates against state/live.sqlite instead")
+    gp.add_argument("--backtest-slippage-bps", type=float, default=3.0)
+    gp.add_argument("--m2-backtest-sign", type=int, default=None, help="+1/-1: sign of M2's backtest expectancy (from RESULTS_V1_5.md)")
+    gp.set_defaults(fn=cmd_gates)
 
     dd = sub.add_parser("data", help="manage the local bar cache")
     ds = dd.add_subparsers(dest="data_cmd", required=True)

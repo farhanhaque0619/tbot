@@ -85,6 +85,12 @@ class OrderInfo:
     notional: float | None = None
     time_in_force: str = ""
     order_type: str = "market"
+    limit_price: float | None = None
+    stop_price: float | None = None
+    order_class: str = "simple"
+    legs: tuple = ()                    # nested legs of a bracket/OTO (OrderInfo)
+    updated_at: datetime | None = None
+    extended_hours: bool = False
 
     @property
     def is_terminal(self) -> bool:
@@ -301,19 +307,23 @@ class AlpacaBroker:
         return QuoteInfo(symbol, ts, float(q.bid_price or 0), float(q.ask_price or 0), float(q.bid_size or 0), float(q.ask_size or 0))
 
     # --------------------------------------------------------------- writes
-    def submit_market_order(self, symbol: str, qty: float, side: str, client_order_id: str, tif: str = "opg") -> OrderInfo:
-        from alpaca.common.exceptions import APIError
-        from alpaca.trading.enums import OrderSide, TimeInForce
-        from alpaca.trading.requests import MarketOrderRequest
+    def _now_et(self) -> datetime | None:
+        """Broker clock for the OPG/CLS acceptance windows (cached 5 s). None when unavailable: the window check is
+        then skipped and the API decides."""
+        cached = getattr(self, "_clock_cache", None)
+        import time as _time
+        if cached and _time.monotonic() - cached[0] < 5:
+            return cached[1]
+        try:
+            ts = self.get_clock().timestamp
+        except Exception as e:  # noqa: BLE001
+            log.warning("clock unavailable for order window check (%s); relying on the API", type(e).__name__)
+            return None
+        self._clock_cache = (_time.monotonic(), ts)
+        return ts
 
-        q = float(qty)
-        if q <= 0:
-            raise ValueError("qty must be positive")
-        if q != int(q) and tif != "day":
-            raise ValueError("fractional quantities require time_in_force=day at Alpaca")
-        req = MarketOrderRequest(symbol=symbol, qty=int(q) if q == int(q) else q,
-                                 side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-                                 time_in_force=TimeInForce(tif), client_order_id=client_order_id)
+    def _submit(self, req, client_order_id: str, symbol: str) -> OrderInfo:
+        from alpaca.common.exceptions import APIError
         try:
             o = with_retry(lambda: self.client.submit_order(req), what=f"submit_order({symbol})")
         except APIError as e:
@@ -324,6 +334,104 @@ class AlpacaBroker:
                 return existing
             raise
         return self._order(o)
+
+    @staticmethod
+    def _qty(q: float):
+        return int(q) if q == int(q) else q
+
+    def submit_market_order(self, symbol: str, qty: float, side: str, client_order_id: str, tif: str = "opg") -> OrderInfo:
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import MarketOrderRequest
+        from bot.execution.constraints import validate_order
+
+        q = float(qty)
+        validate_order(symbol=symbol, qty=q, side=side, order_type="market", tif=tif, now=self._now_et())
+        req = MarketOrderRequest(symbol=symbol, qty=self._qty(q), side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+                                 time_in_force=TimeInForce(tif), client_order_id=client_order_id)
+        return self._submit(req, client_order_id, symbol)
+
+    def submit_limit_order(self, symbol: str, qty: float, side: str, limit_price: float, client_order_id: str, tif: str = "day",
+                           extended_hours: bool = False) -> OrderInfo:
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import LimitOrderRequest
+        from bot.execution.constraints import validate_order
+
+        q = float(qty)
+        v = validate_order(symbol=symbol, qty=q, side=side, order_type="limit", tif=tif, limit_price=limit_price, extended_hours=extended_hours, now=self._now_et())
+        req = LimitOrderRequest(symbol=symbol, qty=self._qty(q), side=OrderSide.BUY if side == "buy" else OrderSide.SELL, time_in_force=TimeInForce(tif),
+                                limit_price=v["limit_price"], extended_hours=extended_hours or None, client_order_id=client_order_id)
+        return self._submit(req, client_order_id, symbol)
+
+    def submit_stop_order(self, symbol: str, qty: float, side: str, stop_price: float, client_order_id: str, tif: str = "gtc") -> OrderInfo:
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import StopOrderRequest
+        from bot.execution.constraints import validate_order
+
+        q = float(qty)
+        v = validate_order(symbol=symbol, qty=q, side=side, order_type="stop", tif=tif, stop_price=stop_price, now=self._now_et())
+        req = StopOrderRequest(symbol=symbol, qty=self._qty(q), side=OrderSide.BUY if side == "buy" else OrderSide.SELL, time_in_force=TimeInForce(tif),
+                               stop_price=v["stop_price"], client_order_id=client_order_id)
+        return self._submit(req, client_order_id, symbol)
+
+    def submit_oto(self, symbol: str, qty: float, side: str, client_order_id: str, *, stop_price: float, entry_type: str = "market",
+                   limit_price: float | None = None, tif: str = "day", base_price: float | None = None) -> OrderInfo:
+        """Entry + stop-loss leg (order_class OTO). Whole shares, DAY/GTC only; stop >= $0.01 from the base price."""
+        from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+        from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, StopLossRequest
+        from bot.execution.constraints import validate_order
+
+        q = float(qty)
+        v = validate_order(symbol=symbol, qty=q, side=side, order_type=entry_type, tif=tif, limit_price=limit_price, stop_price=stop_price,
+                           order_class="oto", base_price=base_price, now=self._now_et())
+        common = dict(symbol=symbol, qty=self._qty(q), side=OrderSide.BUY if side == "buy" else OrderSide.SELL, time_in_force=TimeInForce(tif),
+                      order_class=OrderClass.OTO, stop_loss=StopLossRequest(stop_price=v["stop_price"]), client_order_id=client_order_id)
+        req = LimitOrderRequest(limit_price=v["limit_price"], **common) if entry_type == "limit" else MarketOrderRequest(**common)
+        return self._submit(req, client_order_id, symbol)
+
+    def submit_bracket(self, symbol: str, qty: float, side: str, client_order_id: str, *, take_profit_price: float, stop_price: float,
+                       entry_type: str = "market", limit_price: float | None = None, tif: str = "day", base_price: float | None = None) -> OrderInfo:
+        from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+        from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, StopLossRequest, TakeProfitRequest
+        from bot.execution.constraints import validate_order
+
+        q = float(qty)
+        v = validate_order(symbol=symbol, qty=q, side=side, order_type=entry_type, tif=tif, limit_price=limit_price, stop_price=stop_price,
+                           take_profit_price=take_profit_price, order_class="bracket", base_price=base_price, now=self._now_et())
+        common = dict(symbol=symbol, qty=self._qty(q), side=OrderSide.BUY if side == "buy" else OrderSide.SELL, time_in_force=TimeInForce(tif),
+                      order_class=OrderClass.BRACKET, stop_loss=StopLossRequest(stop_price=v["stop_price"]),
+                      take_profit=TakeProfitRequest(limit_price=v["take_profit_price"]), client_order_id=client_order_id)
+        req = LimitOrderRequest(limit_price=v["limit_price"], **common) if entry_type == "limit" else MarketOrderRequest(**common)
+        return self._submit(req, client_order_id, symbol)
+
+    def replace_order(self, order_id: str, *, qty: float | None = None, limit_price: float | None = None, stop_price: float | None = None,
+                      tif: str | None = None) -> OrderInfo:
+        from alpaca.trading.enums import TimeInForce
+        from alpaca.trading.requests import ReplaceOrderRequest
+        from bot.execution.constraints import OrderConstraintError, can_replace, round_to_tick
+
+        existing = self.get_order_by_id(order_id)
+        if existing is None:
+            raise OrderConstraintError(f"order {order_id} not found; nothing to replace")
+        ok, why = can_replace(existing)
+        if not ok:
+            raise OrderConstraintError(why)
+        if qty is not None and not float(qty).is_integer():
+            raise OrderConstraintError("replace supports whole-share quantities only")
+        req = ReplaceOrderRequest(qty=int(qty) if qty is not None else None, time_in_force=TimeInForce(tif) if tif else None,
+                                  limit_price=round_to_tick(limit_price) if limit_price is not None else None,
+                                  stop_price=round_to_tick(stop_price) if stop_price is not None else None)
+        o = with_retry(lambda: self.client.replace_order_by_id(order_id, req), what="replace_order")
+        return self._order(o)
+
+    def get_orders_since(self, after: datetime, status: str = "all", *, nested: bool = True, limit: int = 500) -> list[OrderInfo]:
+        """Orders submitted after ``after`` (ascending), nested legs included. Used to reconcile after a reconnect/restart."""
+        from alpaca.common.enums import Sort
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        req = GetOrdersRequest(status=QueryOrderStatus(status), after=after, nested=nested, limit=limit, direction=Sort.ASC)
+        orders = with_retry(lambda: self.client.get_orders(req), what="get_orders_since")
+        return [self._order(o) for o in orders]
 
     def cancel_order(self, order_id: str) -> None:
         with_retry(lambda: self.client.cancel_order_by_id(order_id), what="cancel_order")
@@ -367,4 +475,9 @@ class AlpacaBroker:
             submitted_at=o.submitted_at, filled_at=o.filled_at,
             notional=float(o.notional) if o.notional is not None else None,
             time_in_force=ev(o.time_in_force), order_type=ev(o.order_type or o.type),
+            limit_price=float(o.limit_price) if getattr(o, "limit_price", None) is not None else None,
+            stop_price=float(o.stop_price) if getattr(o, "stop_price", None) is not None else None,
+            order_class=ev(getattr(o, "order_class", None) or "simple"),
+            legs=tuple(AlpacaBroker._order(leg) for leg in (getattr(o, "legs", None) or [])),
+            updated_at=getattr(o, "updated_at", None), extended_hours=bool(getattr(o, "extended_hours", False) or False),
         )

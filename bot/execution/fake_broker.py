@@ -8,6 +8,7 @@ Phase 5 constraints can be unit-tested.
 from __future__ import annotations
 
 import itertools
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 
 from bot.data.calendar import NY, SessionInfo, fallback_session
@@ -56,6 +57,7 @@ class FakeBroker:
         self.last_request_id: str | None = "fake-req-0"
         self.calls: list[str] = []
         self.market_open_override: bool | None = None
+        self.legs: dict[str, list[str]] = {}          # parent cid -> leg cids (held until the parent fills)
 
     # ------------------------------------------------------------- test hooks
     def set_price(self, symbol: str, price: float) -> None:
@@ -94,8 +96,12 @@ class FakeBroker:
         prev_notional = (o.filled_avg_price or 0) * o.filled_qty
         avg = (prev_notional + fill_qty * px) / total_filled
         status = "filled" if abs(total_filled - o.qty) < 1e-9 else "partially_filled"
-        self.orders[client_order_id] = OrderInfo(o.id, client_order_id, o.symbol, o.side, o.qty, status, total_filled, avg,
-                                                  o.submitted_at, self.now if status == "filled" else None, o.notional, o.time_in_force)
+        self.orders[client_order_id] = replace(o, status=status, filled_qty=total_filled, filled_avg_price=avg,
+                                               filled_at=self.now if status == "filled" else None)
+        if status == "filled":
+            for leg in self.legs.get(client_order_id, []):
+                if self.orders[leg].status == "held":
+                    self.orders[leg] = replace(self.orders[leg], status="new")
 
     def partial_fill(self, client_order_id: str, qty: float, price: float | None = None) -> None:
         self.fill(client_order_id, qty=qty, price=price)
@@ -108,9 +114,10 @@ class FakeBroker:
     def cancel(self, client_order_id: str) -> None:
         o = self.orders[client_order_id]
         if not o.is_terminal:
-            status = "canceled"
-            self.orders[client_order_id] = OrderInfo(o.id, client_order_id, o.symbol, o.side, o.qty, status, o.filled_qty,
-                                                      o.filled_avg_price, o.submitted_at, None, o.notional, o.time_in_force)
+            self.orders[client_order_id] = replace(o, status="canceled")
+            for leg in self.legs.get(client_order_id, []):
+                if not self.orders[leg].is_terminal:
+                    self.orders[leg] = replace(self.orders[leg], status="canceled")
 
     # ---------------------------------------------------------- Broker protocol
     def get_account(self) -> AccountInfo:
@@ -152,10 +159,7 @@ class FakeBroker:
         if symbol not in self.prices:
             raise FakeAPIError(f"asset {symbol} not found", 422)
         q = float(qty)
-        if q <= 0:
-            raise FakeAPIError("qty must be > 0", 422)
-        if q != int(q) and tif != "day":
-            raise FakeAPIError("fractional orders must be DAY orders", 422)
+        self._check(symbol, q, side, "market", tif)
         asset = self.assets.get(symbol)
         if q != int(q) and asset is not None and not asset.fractionable:
             raise FakeAPIError(f"{symbol} is not fractionable", 422)
@@ -170,9 +174,92 @@ class FakeBroker:
         self.submitted.append(o)
         return o
 
+    def _new_order(self, symbol, qty, side, client_order_id, tif, order_type, *, limit_price=None, stop_price=None, order_class="simple",
+                   status="new", extended_hours=False) -> OrderInfo:
+        o = OrderInfo(str(next(self._ids)), client_order_id, symbol, side, float(qty), status, 0.0, None, self.now, None, None, tif, order_type,
+                      limit_price, stop_price, order_class, (), self.now, extended_hours)
+        self.orders[client_order_id] = o
+        self.submitted.append(o)
+        return o
+
+    def _check(self, symbol, qty, side, order_type, tif, **kw) -> dict:
+        from bot.execution.constraints import OrderConstraintError, validate_order
+        if symbol not in self.prices:
+            raise FakeAPIError(f"asset {symbol} not found", 422)
+        try:
+            return validate_order(symbol=symbol, qty=float(qty), side=side, order_type=order_type, tif=tif, now=self.now, **kw)
+        except OrderConstraintError as e:
+            raise FakeAPIError(str(e), 422) from e
+
+    def submit_limit_order(self, symbol, qty, side, limit_price, client_order_id, tif="day", extended_hours=False) -> OrderInfo:
+        self._maybe_fail("submit_limit_order")
+        if client_order_id in self.orders:
+            raise DuplicateClientOrderId(client_order_id)
+        v = self._check(symbol, qty, side, "limit", tif, limit_price=limit_price, extended_hours=extended_hours)
+        return self._new_order(symbol, qty, side, client_order_id, tif, "limit", limit_price=v["limit_price"], extended_hours=extended_hours)
+
+    def submit_stop_order(self, symbol, qty, side, stop_price, client_order_id, tif="gtc") -> OrderInfo:
+        self._maybe_fail("submit_stop_order")
+        if client_order_id in self.orders:
+            raise DuplicateClientOrderId(client_order_id)
+        v = self._check(symbol, qty, side, "stop", tif, stop_price=stop_price)
+        return self._new_order(symbol, qty, side, client_order_id, tif, "stop", stop_price=v["stop_price"])
+
+    def submit_oto(self, symbol, qty, side, client_order_id, *, stop_price, entry_type="market", limit_price=None, tif="day", base_price=None) -> OrderInfo:
+        self._maybe_fail("submit_oto")
+        if client_order_id in self.orders:
+            raise DuplicateClientOrderId(client_order_id)
+        v = self._check(symbol, qty, side, entry_type, tif, limit_price=limit_price, stop_price=stop_price, order_class="oto",
+                        base_price=base_price or self.prices.get(symbol))
+        parent = self._new_order(symbol, qty, side, client_order_id, tif, entry_type, limit_price=v.get("limit_price"), order_class="oto")
+        leg = self._new_order(symbol, qty, "sell" if side == "buy" else "buy", client_order_id + "-stop", "gtc", "stop", stop_price=v["stop_price"],
+                              order_class="oto", status="held")
+        self.legs[client_order_id] = [leg.client_order_id]
+        return replace(parent, legs=(leg,))
+
+    def submit_bracket(self, symbol, qty, side, client_order_id, *, take_profit_price, stop_price, entry_type="market", limit_price=None, tif="day",
+                       base_price=None) -> OrderInfo:
+        self._maybe_fail("submit_bracket")
+        if client_order_id in self.orders:
+            raise DuplicateClientOrderId(client_order_id)
+        v = self._check(symbol, qty, side, entry_type, tif, limit_price=limit_price, stop_price=stop_price, take_profit_price=take_profit_price,
+                        order_class="bracket", base_price=base_price or self.prices.get(symbol))
+        parent = self._new_order(symbol, qty, side, client_order_id, tif, entry_type, limit_price=v.get("limit_price"), order_class="bracket")
+        exit_side = "sell" if side == "buy" else "buy"
+        stop = self._new_order(symbol, qty, exit_side, client_order_id + "-stop", "gtc", "stop", stop_price=v["stop_price"], order_class="bracket", status="held")
+        tp = self._new_order(symbol, qty, exit_side, client_order_id + "-tp", "gtc", "limit", limit_price=v["take_profit_price"], order_class="bracket", status="held")
+        self.legs[client_order_id] = [stop.client_order_id, tp.client_order_id]
+        return replace(parent, legs=(stop, tp))
+
+    def replace_order(self, order_id: str, *, qty=None, limit_price=None, stop_price=None, tif=None) -> OrderInfo:
+        from bot.execution.constraints import can_replace, round_to_tick
+        self._maybe_fail("replace_order")
+        for cid, o in self.orders.items():
+            if o.id == order_id:
+                ok, why = can_replace(o)
+                if not ok:
+                    raise FakeAPIError(why, 422)
+                new = replace(o, id=str(next(self._ids)), qty=float(qty) if qty is not None else o.qty,
+                              limit_price=round_to_tick(limit_price) if limit_price is not None else o.limit_price,
+                              stop_price=round_to_tick(stop_price) if stop_price is not None else o.stop_price,
+                              time_in_force=tif or o.time_in_force, updated_at=self.now)
+                self.orders[cid] = new
+                self.submitted.append(new)
+                return new
+        raise FakeAPIError(f"order {order_id} not found", 404)
+
+    def get_orders_since(self, after: datetime, status: str = "all", *, nested: bool = True, limit: int = 500) -> list[OrderInfo]:
+        self._maybe_fail("get_orders_since")
+        out = [o for o in self.orders.values() if o.submitted_at is not None and o.submitted_at > after]
+        if status == "open":
+            out = [o for o in out if o.is_open]
+        elif status == "closed":
+            out = [o for o in out if o.is_terminal]
+        return sorted(out, key=lambda o: (o.submitted_at, int(o.id)))[:limit]
+
     def cancel_order(self, order_id: str) -> None:
         self._maybe_fail("cancel_order")
-        for cid, o in self.orders.items():
+        for cid, o in list(self.orders.items()):
             if o.id == order_id:
                 self.cancel(cid)
 

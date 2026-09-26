@@ -36,6 +36,7 @@ class ArmState:
     safe_fingerprint: str
     confirmed_phrase: bool
     operator: str = ""
+    policy_fingerprint: str = ""          # SHA-256 of the armed RiskPolicy (V1.5); "" for a pre-V1.5 arm file
 
     @property
     def expired(self) -> bool:
@@ -51,7 +52,7 @@ class LiveInterlock:
         self.safe = SafeLiveLimits.from_settings(settings) if settings.safe_live_test_mode else None
 
     # ------------------------------------------------------------- arm state
-    def arm(self, *, typed_phrase: str, acknowledged: bool, ttl_minutes: int | None = None) -> ArmState:
+    def arm(self, *, typed_phrase: str, acknowledged: bool, ttl_minutes: int | None = None, policy_fingerprint: str = "") -> ArmState:
         if typed_phrase.strip() != LIVE_CONFIRMATION_PHRASE:
             raise PermissionError("confirmation phrase did not match; not armed")
         if not acknowledged:
@@ -63,7 +64,7 @@ class LiveInterlock:
         ttl = ttl_minutes or self.settings.live_arm_ttl_minutes
         now = datetime.now(timezone.utc)
         st = ArmState(now.isoformat(), (now + timedelta(minutes=ttl)).isoformat(),
-                      self.safe.fingerprint() if self.safe else "unsafe-mode", True, os.environ.get("USER", ""))
+                      self.safe.fingerprint() if self.safe else "unsafe-mode", True, os.environ.get("USER", ""), policy_fingerprint)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(st.__dict__, indent=2))
         return st
@@ -86,7 +87,8 @@ class LiveInterlock:
         except (ValueError, TypeError):
             return None
 
-    def is_armed(self) -> tuple[bool, str]:
+    def is_armed(self, *, policy_fingerprint: str | None = None) -> tuple[bool, str]:
+        """Armed, not expired, safe limits unchanged and (when a policy fingerprint is given) the same policy as armed."""
         st = self.arm_state()
         if st is None:
             return False, "not armed (run: python -m bot live arm)"
@@ -97,20 +99,32 @@ class LiveInterlock:
             return False, "safe-mode limits changed since arming; re-arm required"
         if not st.confirmed_phrase:
             return False, "confirmation phrase missing"
-        return True, f"armed until {st.expires_at}"
+        if policy_fingerprint is not None:
+            if not st.policy_fingerprint:
+                return False, "armed without a policy fingerprint; re-arm with the current policy"
+            if st.policy_fingerprint != policy_fingerprint:
+                return False, f"policy changed since arming (armed {st.policy_fingerprint[:12]}…, loaded {policy_fingerprint[:12]}…); re-arm required"
+        return True, f"armed until {st.expires_at}" + (f" with policy {st.policy_fingerprint[:12]}…" if st.policy_fingerprint else "")
 
     # ------------------------------------------------------------------ gates
     def check(self, *, cli_live_flag: bool, account=None, account_env_ok: tuple[bool, str] | None = None,
               data_fresh: bool | None = None, risk_manager=None, risk_last_error: str | None = None,
-              require_armed: bool = True) -> list[Gate]:
+              require_armed: bool = True, policy=None, promotions_path=None) -> list[Gate]:
         s = self.settings
         gates = [
             Gate("live_credentials_present", s.has_credentials("live"), "ALPACA_LIVE_API_KEY / ALPACA_LIVE_SECRET_KEY"),
             Gate("trading_env_is_live", s.trading_env == "live", f"TRADING_ENV={s.trading_env}"),
             Gate("cli_live_flag", cli_live_flag, "--live"),
         ]
-        armed, why = self.is_armed()
+        fp = policy.fingerprint() if policy is not None else None
+        armed, why = self.is_armed(policy_fingerprint=fp)
         gates.append(Gate("operator_confirmation_and_armed", armed if require_armed else True, why))
+        if policy is not None:
+            st = self.arm_state()
+            gates.append(Gate("policy_fingerprint_matches", bool(st and st.policy_fingerprint == fp), f"loaded {fp[:12]}…"))
+            from bot.core.policy import PROMOTIONS_PATH
+            bad = policy.unpromoted_modules(promotions_path or PROMOTIONS_PATH)
+            gates.append(Gate("live_modules_promoted", not bad, "all promoted" if not bad else f"unpromoted: {bad} (research/PROMOTIONS.md)"))
         if account_env_ok is not None:
             gates.append(Gate("account_is_not_paper", account_env_ok[0], account_env_ok[1]))
         else:

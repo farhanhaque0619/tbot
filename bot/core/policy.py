@@ -66,6 +66,7 @@ class RiskPolicy(BaseModel):
     legacy_atr_stop_mult: float = Field(2.0, gt=0)
     legacy_max_position_pct: float = Field(0.50, gt=0, le=1.0)
     min_notional: float = Field(1.0, ge=0)
+    orphan_policy: Literal["adopt", "flatten"] = "adopt"    # broker positions nobody owns: adopt as module "orphan" (with protection) or flatten
 
     # ------------------------------------------------------------------ helpers
     def canonical_json(self) -> str:

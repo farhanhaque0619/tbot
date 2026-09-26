@@ -203,3 +203,24 @@ Decisions (additions to §3):
 Baselines after Phase 3: `python -m bot backtest --strategy ma_crossover --symbol SP500 --start 2000-01-03 --end 2022-12-28 --no-save`
 re-run, +95.72%, Sharpe 0.51, 26 trades, walk-forward +53.00%, Sharpe 0.55, 56 trades (§2.3). `bot/backtest/engine.py`,
 `bot/strategies/{ma_crossover,mean_reversion}.py` unchanged; `research compare` and `research surface` still run on the baselines.
+
+## 8. Phase 4 record (spine)
+
+Built: `bot/execution/constraints.py` (documented Alpaca constraints enforced before any call), `AlpacaBroker.submit_limit_order/
+submit_stop_order/submit_oto/submit_bracket/replace_order/get_orders_since` with nested legs on `OrderInfo`, the same on
+`FakeBroker`; `bot/execution/store.py` (SQLite WAL: orders, fills, positions, risk_state, decisions, heartbeats, throttles,
+protective_orders, watermarks, trades, meta; two-transaction submit; `migrate_from_json`); `OrderManager(store=…)` persistence
+and `restore()`; `bot/execution/reconcile.py`; `bot/execution/gates.py`; interlock policy fingerprint + promotion gate; CLI
+`state migrate|show`, `risk unthrottle`, `gates`; `RiskPolicy.orphan_policy`; gated `tests/integration/test_v15_orders.py`.
+
+| # | Item | Decision |
+|---|---|---|
+| D20 | Live arming vs promotions | `live arm` loads the live policy with `require_promotions=True`. Nothing is promoted, so arming refuses today. The V1 baseline can still be run live only if the operator deliberately adds `ma_crossover` to `allowed_modules` (legacy modules are exempt from the promotion check, their gate is FINAL_REPORT.md). This is the safe reading of spec §11 and the operator's "never auto-enable live". |
+| D21 | Constraint windows need a clock | OPG/CLS acceptance windows are checked against the broker clock (cached 5 s). When the clock call fails the window check is skipped and the API decides; every other constraint is checked without network. |
+| D22 | OTO/bracket with auction TIFs | The tables say unsupported; the local validator refuses. `test_oto_and_bracket_nested_legs` fails loudly if the paper API accepts it, so the operator's first integration run settles it. |
+| D23 | Cross-module netting | Still serialised (D8). A true net-to-one-broker-order path would need fill apportioning across slices; deferred, recorded here so it is not mistaken for an oversight. |
+| D24 | Orphans | New policy field `orphan_policy: adopt|flatten` (default adopt: the position becomes module `orphan` with a 5% protective stop when protection is required). Both policy files carry the default. Fingerprints of the policy files changed with the new field; nothing was armed. |
+
+Baselines after Phase 4: `python -m bot backtest --strategy ma_crossover --symbol SP500 --start 2000-01-03 --end 2022-12-28 --no-save`
+re-run, +95.72%, Sharpe 0.51, 26 trades, walk-forward +53.00%, Sharpe 0.55, 56 trades (§2.3). `engine.py` and both baseline
+strategies unchanged; `FakeBroker.submit_market_order` now runs the shared validator (same rules as before plus the OPG/CLS window).

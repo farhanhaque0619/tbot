@@ -129,3 +129,27 @@ an issue before considering the constrained-autonomous phase.
 - `python -m bot live disarm`, then if a position is open and you want out: close it in the Alpaca dashboard.
 - Kill switch tripped: it liquidated everything and refuses to trade. Investigate, then `python -m bot risk reset --run-id live`.
 - Suspect a key leak: rotate in the dashboard immediately; everything else can wait.
+
+---
+
+## V1.5 additions (Phase 4)
+
+**Policy fingerprint.** `python -m bot live arm` loads `config/policy.live.yaml` with the promotion check, prints its
+SHA-256 fingerprint and stores it in the arm file. `live check` and the daemon compare the loaded policy with the
+armed fingerprint; any edit to the policy file disarms (gate `policy_fingerprint_matches`). No module in the live
+policy may lack a line in `research/PROMOTIONS.md` (gate `live_modules_promoted`); today nothing is promoted, so
+arming refuses. That is the intended state until the research protocol completes on the sealed cut D.
+
+**PDT check.** `policy.pdt_mode` must match the account: `legacy_guard` (sub-$25k, the RiskEngine refuses an M2 intent
+that would create a 4th day trade in 5 sessions from `AccountInfo.daytrade_count` and its own ledger), `intraday_margin`
+(verified $25k+), or `none` (M2 excluded). Verify from `python -m bot status --live` before editing the policy.
+
+**Protective-order policy.** Whole-share overnight entries carry an OTO stop leg; auction (OPG/CLS) entries get a
+standalone GTC stop on fill; fractional positions get a DAY stop re-placed at every pre-open and are reported as
+`unprotected_overnight`; a rejected protective order marks the slice `unprotected`, alerts, and flattens at the next
+eligible time when `require_broker_protection_overnight` is true. An exit or flatten cancels the protective order first.
+
+**State.** The runtime persists to `state/<run-id>.sqlite` (WAL). `python -m bot state migrate --run-id paper` imports the
+V1 JSON file once; `state show` summarises; `risk unthrottle --module M2` is the only way to restore a halved budget.
+`python -m bot gates` prints the paper→live candidate gates from the store; `gates --live` the step-up gates. Both are
+read-only.
