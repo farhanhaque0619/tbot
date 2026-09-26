@@ -425,6 +425,41 @@ def cmd_live(args) -> int:
     return 1
 
 
+def cmd_smoke(args) -> int:
+    """PAPER-ONLY execution smoke test. Submits one tiny fractional order and closes it (or ack+cancel when closed)."""
+    from bot.execution.smoke import PaperSmokeTest, SmokeRefusal
+
+    settings = get_settings()
+    if settings.trading_env != "paper":
+        raise SystemExit(f"smoke test is paper-only; TRADING_ENV={settings.trading_env!r}. Refusing.")
+    _print_banner("paper")
+    broker = _broker(settings, "paper")
+    console.print(f"smoke test: {args.symbol} ≈ ${args.notional:.2f} fractional DAY order on PAPER account, then close it. "
+                  f"Market closed -> ack/duplicate/cancel only. Run id: {args.run_id or '(timestamp)'}")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise SystemExit("non-interactive: pass --yes to confirm a paper order")
+        if input("Type PAPER to submit a paper order: ").strip() != "PAPER":
+            raise SystemExit("aborted")
+    try:
+        t = PaperSmokeTest(settings=settings, broker=broker, symbol=args.symbol, notional=args.notional,
+                           wait_seconds=args.wait, run_id=args.run_id)
+    except SmokeRefusal as e:
+        console.print(f"[red]REFUSED: {e}[/red]")
+        return 1
+    rep = t.run()
+    tbl = Table(title=f"paper smoke test · {rep.run_id}", header_style="bold")
+    for c in ("Step", "Status", "Detail", "Order id", "Request id"):
+        tbl.add_column(c)
+    for st in rep.steps:
+        colour = {"PASS": "green", "FAIL": "red", "SKIP": "yellow"}[st.status]
+        tbl.add_row(st.name, f"[{colour}]{st.status}[/{colour}]", st.detail[:110], st.order_id or "", st.request_id or "")
+    console.print(tbl)
+    console.print(f"[{'green' if rep.ok else 'red'}]smoke: {'PASS' if rep.ok else 'FAIL'}[/] · market_open={rep.market_open} · "
+                  f"report reports/smoke_paper_{rep.run_id}.json · state {settings.state_dir}/{rep.run_id}.json")
+    return 0 if rep.ok else 1
+
+
 def cmd_dashboard(args) -> int:
     from bot.monitoring.dashboard import show
 
@@ -565,6 +600,15 @@ def build_parser() -> argparse.ArgumentParser:
     lc = ls.add_parser("check"); lc.add_argument("--symbol", default="SPY")
     ls.add_parser("arm"); ls.add_parser("disarm")
     lv.set_defaults(fn=cmd_live)
+
+    sm = sub.add_parser("smoke", help="PAPER-ONLY execution smoke test: tiny fractional order, fill, reconcile, close (no --live exists)")
+    sm.add_argument("--paper", action="store_true", help="accepted for symmetry; the smoke test is always paper")
+    sm.add_argument("--symbol", default="SPY")
+    sm.add_argument("--notional", type=float, default=2.0, help="target dollars for the entry (max 25)")
+    sm.add_argument("--wait", type=int, default=180, help="seconds to wait for each fill")
+    sm.add_argument("--run-id", default=None, help="must start with 'smoke-'; default is a timestamp")
+    sm.add_argument("--yes", action="store_true", help="skip the interactive PAPER confirmation")
+    sm.set_defaults(fn=cmd_smoke)
 
     db = sub.add_parser("dashboard", help="show equity, positions, trades from the state file")
     db.add_argument("--run-id", default="paper")
