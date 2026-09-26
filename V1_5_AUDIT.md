@@ -148,3 +148,31 @@ Nothing in the spec conflicts with the eight non-negotiable rules; D2 is the onl
 Every phase's final commit message states which of §2.1 (when the operator's cache is present) or §2.3 (always) numbers
 were re-run and matched. `python -m bot backtest --strategy ma_crossover --symbol SP500 --start 2000-01-03 --end 2022-12-28`
 must print total +95.72%, Sharpe 0.51, 26 trades, walk-forward +53.00%, Sharpe 0.55, 56 trades after every phase.
+
+## 6. Phase 2 record (backtester + spine, built ahead of Phase 4 because the engine needs the same decision path)
+
+Built: `bot/core/{events,intents,policy}.py`, `config/policy.{paper,live}.yaml`, `bot/backtest/{fills,simbroker,engine_v15}.py`,
+`bot/portfolio/allocator.py`, `bot/risk/policy_engine.py`, `bot/execution/oms.py`, `bot/features/engine.py`,
+`bot/strategies/adapter.py`; tests `tests/v15/test_{fills_simbroker,allocator,policy_engine,oms,features,legacy_reproduction,engine_v15_minute}.py`
+and four more architecture tests. The spine modules listed under Phase 4 in §4 exist now because `run_minute` drives the
+same Allocator → RiskEngine → OrderManager path the daemon will use; Phase 4 adds the broker methods, SQLite store and CLI.
+
+Reproduction (D6): `run_daily_legacy` matches `bot/backtest/engine.py` with max relative equity difference 0.00e+00 and
+identical trade lists on synthetic series, SP500 2000–2022 (both baselines) and GOOG 2005–2013 (`tests/v15/test_legacy_reproduction.py`;
+the SP500 case runs whenever `data_cache/bars.duckdb` holds the proxy). Four reproduction fixes were needed and are recorded
+in the adapter/engine docstrings: sector cap 1.0 in `legacy_policy`, `market` (not auction) style so fractional rounding
+matches V1, `market_open=True` at the daily reconcile, throttle disabled in legacy mode.
+
+Decisions made while building (additions to §3):
+
+| # | Item | Decision |
+|---|---|---|
+| D8 | Two modules order the same symbol in one event | Serialised, not netted into one broker order: RiskManager's `no_outstanding_order_conflict` blocks the second module's order for that event (decision `blocked`), it re-emits on its next event. Netting at the broker happens through fills; module slices stay separate in the ledger. Tested. |
+| D9 | Exit while a protective stop rests | The OrderManager cancels the slice's protective order before submitting a module exit or a flatten (otherwise both could fill). A cancel failure re-arms the protective record and alerts; the exit still passes through the risk gate, which will then block it on the open-order conflict. Tested. |
+| D10 | Clock convention | `ScheduleEvent.ts` and the SimBroker clock are the START of the last completed 1-minute bar; a decision made on bar `t` fills no earlier than bar `t+1`. So `t1558` fires on the 15:57 bar (12:57 on an early close), `t1550` on 15:49, `t1530` at the 30-minute bucket ending 15:30; all three are computed relative to the session close so early closes get the same marks. Tested on 2026-11-27. |
+| D11 | Attribution | `overnight` = prev close → official open on positions held into the session; everything else (auction fills and their costs, intraday moves) is `intraday`, so the two sum to the module's P&L. Tested. |
+| D12 | FeatureSnapshot between sessions | At `pre_open`/`session_open` before the first bar, `prev_session_close` is the last completed session's close and session fields (`session_open`, `r1`, `r12`, VWAP, volume) are empty; the engine never exposes the coming session's open before its first bar. Tested. |
+
+Baselines after Phase 2: `python -m bot backtest --strategy ma_crossover --symbol SP500 --start 2000-01-03 --end 2022-12-28 --no-save`
+prints +95.72%, Sharpe 0.51, 26 trades, walk-forward +53.00%, Sharpe 0.55, 56 trades (§2.3, re-run 2026-09-26). §2.1/§2.2 real-data
+numbers cannot be re-run in this environment (no Alpaca route); `bot/backtest/engine.py` and the two baseline strategies are unchanged.

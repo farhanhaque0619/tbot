@@ -1,0 +1,29 @@
+# RiskPolicy for LIVE (Phase 2/4). D2 in V1_5_AUDIT.md: M2 is NOT allowed until the operator verifies the
+# account's PDT regime and edits this file. SafeLiveLimits dollar caps apply on top of everything here.
+name: live
+allowed_modules: [M1]
+allowed_symbols: [SPY, QQQ]
+max_order_notional_pct: 0.25
+max_symbol_exposure_pct: 0.6
+max_module_gross_pct: {M1: 0.6, M2: 0.3}
+max_gross_pct: 1.0
+max_net_pct: 1.0
+min_net_pct: 0.0
+max_sector_pct_of_gross: 1.0
+max_daily_loss_pct: 0.02
+max_drawdown_pct: 0.12
+max_open_positions: 6
+allow_short: false
+allow_margin: false
+allow_overnight: {M1: true, M2: false}
+allow_extended_hours: false
+max_spread_bps: {etf: 3.0, stock: 8.0}
+max_stale_seconds_intraday: 90
+max_stale_seconds_auction: 900
+pdt_mode: legacy_guard
+require_broker_protection_overnight: true
+legacy_atr_stop: true
+legacy_risk_pct: 0.01
+legacy_atr_stop_mult: 2.0
+legacy_max_position_pct: 0.5
+min_notional: 1.0

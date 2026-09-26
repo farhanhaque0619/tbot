@@ -1,0 +1,28 @@
+# RiskPolicy for the PAPER environment (Phase 2/4). Operator-owned. The bot never edits this file.
+name: paper
+allowed_modules: [M1, M2, M3, ma_crossover, mean_reversion]
+allowed_symbols: []
+max_order_notional_pct: 0.5
+max_symbol_exposure_pct: 0.5
+max_module_gross_pct: {M1: 0.6, M2: 0.5, M3: 0.5}
+max_gross_pct: 1.5
+max_net_pct: 1.5
+min_net_pct: -0.5
+max_sector_pct_of_gross: 0.3
+max_daily_loss_pct: 0.03
+max_drawdown_pct: 0.20
+max_open_positions: 12
+allow_short: true
+allow_margin: true
+allow_overnight: {M1: true, M3: true, ma_crossover: true, mean_reversion: true, M2: false}
+allow_extended_hours: false
+max_spread_bps: {etf: 5.0, stock: 10.0}
+max_stale_seconds_intraday: 90
+max_stale_seconds_auction: 900
+pdt_mode: intraday_margin
+require_broker_protection_overnight: true
+legacy_atr_stop: true
+legacy_risk_pct: 0.01
+legacy_atr_stop_mult: 2.0
+legacy_max_position_pct: 0.5
+min_notional: 1.0

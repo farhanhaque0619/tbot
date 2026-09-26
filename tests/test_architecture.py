@@ -53,3 +53,44 @@ def test_execution_registry_only_contains_baselines():
     from bot.strategies import STRATEGIES
     assert set(STRATEGIES) == {"ma_crossover", "mean_reversion"}
     assert not set(RESEARCH_STRATEGIES) & set(STRATEGIES)
+
+
+# ---------------------------------------------------------------- V1.5 (Phase 2) layering
+BROKER_PATHS = ("bot.execution.broker", "bot.execution.oms", "bot.execution.paper_loop", "bot.execution.interlock", "bot.execution.smoke", "alpaca")
+
+
+def test_strategy_feature_portfolio_layers_cannot_reach_order_submission():
+    """Strategies express opinions; the allocator sizes; neither may import anything that can submit an order."""
+    for f in modules("strategies") + modules("portfolio") + modules("features") + modules("core") + modules("advisor"):
+        imps = imports_of(f)
+        bad = [i for i in imps if any(i == x or i.startswith(x + ".") for x in BROKER_PATHS)]
+        assert not bad, f"{f.relative_to(ROOT)} imports {bad}"
+
+
+def test_core_and_risk_sit_below_strategy_portfolio_and_execution():
+    for f in modules("core") + modules("risk"):
+        imps = imports_of(f)
+        bad = [i for i in imps if i.startswith(("bot.execution", "bot.strategies", "bot.portfolio", "bot.features", "bot.backtest", "bot.research", "bot.advisor"))]
+        assert not bad, f"{f.relative_to(ROOT)} imports {bad}"
+
+
+def test_nothing_in_bot_mutates_a_risk_policy():
+    """RiskPolicy is frozen; the only way to get a different policy is a new file + fingerprint. No runtime copies with edits."""
+    for pkg in ("strategies", "portfolio", "features", "execution", "backtest", "risk", "core", "research", "advisor", "monitoring"):
+        for f in modules(pkg):
+            src = f.read_text(encoding="utf-8")
+            tree = ast.parse(src)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "model_copy":
+                    raise AssertionError(f"{f.relative_to(ROOT)} copies a pydantic model with edits (policy mutation path)")
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "__setattr__":
+                    raise AssertionError(f"{f.relative_to(ROOT)} uses __setattr__")
+
+
+def test_policy_files_are_frozen_and_live_is_stricter_than_paper():
+    from bot.core.policy import RiskPolicy
+    paper, live = RiskPolicy.load("config/policy.paper.yaml"), RiskPolicy.load("config/policy.live.yaml")
+    assert live.max_gross_pct <= paper.max_gross_pct and live.max_drawdown_pct <= paper.max_drawdown_pct
+    assert live.max_daily_loss_pct <= paper.max_daily_loss_pct and not live.allow_short and not live.allow_margin
+    assert set(live.allowed_modules) <= set(paper.allowed_modules) and live.allowed_symbols
+    assert paper.model_config.get("frozen") is True
