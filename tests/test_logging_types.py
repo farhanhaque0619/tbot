@@ -3,11 +3,10 @@
 import logging
 from datetime import date
 
-import pytest
 
 from bot.data.loader import BarLoader
 from bot.data.store import BarStore
-from bot.monitoring.logging import RedactFilter, log_event
+from bot.monitoring.logging import RedactFilter
 from tests.conftest import make_bars
 from tests.test_data_and_config import ScriptedProvider
 
