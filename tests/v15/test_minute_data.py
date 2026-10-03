@@ -1,4 +1,5 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from types import SimpleNamespace
 
@@ -8,7 +9,7 @@ import pytest
 
 from bot.data.calendar import NY
 from bot.data.minute import aggregate, fetch_minute_history
-from bot.data.providers import DataPlanError, is_subscription_error, sip_lagged_end
+from bot.data.providers import DataPlanError, alpaca_request_window, is_subscription_error, sip_lagged_end
 from bot.data.quality import check_minute_frame
 from bot.data.sessions import SessionCalendar
 from bot.data.store import BarStore
@@ -178,6 +179,79 @@ def test_alpaca_minute_fetch_applies_lag_and_converts_timestamps():
     prov2, calls2 = _alpaca_provider_with_stub(response=SimpleNamespace(df=utc))
     prov2.fetch_minute("SPY", datetime(2026, 9, 25, 9, 30, tzinfo=NY), datetime(2026, 9, 25, 14, 0, tzinfo=NY), feed="iex", now=now)
     assert calls2[0].end.astimezone(NY) == datetime(2026, 9, 25, 14, 0, tzinfo=NY), "IEX is not lagged"
+
+
+# ---------------------------------------------------------------- request datetime convention (aware UTC at the API boundary)
+UTC = timezone.utc
+TOKYO = ZoneInfo("Asia/Tokyo")
+
+
+def _lag_request(start, end, now, feed="sip"):
+    prov, calls = _alpaca_provider_with_stub(response=SimpleNamespace(df=pd.DataFrame()))
+    prov.fetch_minute("SPY", start, end, feed=feed, now=now)
+    return calls[0]
+
+
+def test_request_window_is_aware_utc_for_aware_ny_and_aware_utc_inputs():
+    start_ny, end_ny = datetime(2026, 9, 25, 9, 30, tzinfo=NY), datetime(2026, 9, 25, 16, 0, tzinfo=NY)
+    now = datetime(2026, 9, 25, 15, 0, tzinfo=NY)
+    s, e = alpaca_request_window(start_ny, end_ny, now=now, feed="sip")
+    assert s.utcoffset() == timedelta(0) and e.utcoffset() == timedelta(0) and s.tzinfo is not None, "aware UTC (ZoneInfo or timezone.utc: same instant)"
+    assert s == datetime(2026, 9, 25, 13, 30, tzinfo=UTC) and e == datetime(2026, 9, 25, 18, 44, tzinfo=UTC)
+    s2, e2 = alpaca_request_window(start_ny.astimezone(UTC), end_ny.astimezone(UTC), now=now.astimezone(UTC), feed="sip")
+    assert (s2, e2) == (s, e), "aware UTC inputs describe the same instants"
+    s3, e3 = alpaca_request_window(start_ny.astimezone(TOKYO), end_ny.astimezone(TOKYO), now=now.astimezone(TOKYO), feed="sip")
+    assert (s3, e3) == (s, e), "any aware zone describes the same instants"
+    s4, e4 = alpaca_request_window(datetime(2026, 9, 25, 9, 30), datetime(2026, 9, 25, 16, 0), now=now, feed="sip")
+    assert (s4, e4) == (s, e), "naive inputs are New York wall clock by convention"
+
+
+def test_request_window_handles_dst_summer_and_winter():
+    summer = alpaca_request_window(datetime(2026, 7, 6, 9, 30, tzinfo=NY), datetime(2026, 7, 6, 16, 0, tzinfo=NY), now=datetime(2026, 7, 7, tzinfo=NY), feed="iex")
+    winter = alpaca_request_window(datetime(2026, 12, 7, 9, 30, tzinfo=NY), datetime(2026, 12, 7, 16, 0, tzinfo=NY), now=datetime(2026, 12, 8, tzinfo=NY), feed="iex")
+    assert summer == (datetime(2026, 7, 6, 13, 30, tzinfo=UTC), datetime(2026, 7, 6, 20, 0, tzinfo=UTC))       # EDT = UTC-4
+    assert winter == (datetime(2026, 12, 7, 14, 30, tzinfo=UTC), datetime(2026, 12, 7, 21, 0, tzinfo=UTC))     # EST = UTC-5
+
+
+def test_request_window_lag_rules():
+    now = datetime(2026, 9, 25, 15, 0, tzinfo=NY)
+    _, e = alpaca_request_window(datetime(2026, 9, 25, 9, 30, tzinfo=NY), datetime(2026, 9, 25, 16, 0, tzinfo=NY), now=now, feed="sip")
+    assert e == datetime(2026, 9, 25, 14, 44, tzinfo=NY), "SIP end is now - 16 minutes"
+    _, e = alpaca_request_window(datetime(2026, 9, 25, 9, 30, tzinfo=NY), datetime(2026, 9, 25, 14, 0, tzinfo=NY), now=now, feed="sip")
+    assert e == datetime(2026, 9, 25, 14, 0, tzinfo=NY), "an end earlier than the cutoff is kept"
+    _, e = alpaca_request_window(datetime(2026, 9, 25, 9, 30, tzinfo=NY), datetime(2026, 9, 25, 16, 0, tzinfo=NY), now=now, feed="iex")
+    assert e == datetime(2026, 9, 25, 16, 0, tzinfo=NY), "IEX inherits no SIP lag"
+
+
+def test_sdk_request_fields_stay_aware_and_serialize_the_same_instant():
+    now = datetime(2026, 9, 25, 15, 0, tzinfo=NY)
+    req = _lag_request(datetime(2026, 9, 25, 9, 30, tzinfo=NY), datetime(2026, 9, 25, 16, 0, tzinfo=NY), now)
+    assert req.start.tzinfo is not None and req.end.tzinfo is not None, "request bounds are timezone-aware on the SDK object"
+    assert req.start == datetime(2026, 9, 25, 13, 30, tzinfo=UTC) and req.end == datetime(2026, 9, 25, 18, 44, tzinfo=UTC)
+    fields = req.to_request_fields()
+    assert fields["start"] == "2026-09-25T13:30:00+00:00" and fields["end"] == "2026-09-25T18:44:00+00:00", "wire format carries the instant"
+    # the same request built with UTC inputs is identical on the wire
+    req2 = _lag_request(datetime(2026, 9, 25, 13, 30, tzinfo=UTC), datetime(2026, 9, 25, 20, 0, tzinfo=UTC), now.astimezone(UTC))
+    assert req2.to_request_fields()["end"] == fields["end"] and req2.end == req.end
+    # a request whose end is earlier than the lag cutoff is not lagged; an empty window makes no call
+    prov, calls = _alpaca_provider_with_stub(response=SimpleNamespace(df=pd.DataFrame()))
+    out = prov.fetch_minute("SPY", datetime(2026, 9, 25, 14, 50, tzinfo=NY), datetime(2026, 9, 25, 16, 0, tzinfo=NY), feed="sip", now=now)
+    assert out.empty and calls == [], "start after the SIP cutoff: nothing to request"
+
+
+def test_request_instants_do_not_depend_on_the_host_timezone(monkeypatch):
+    import time as _time
+    now = datetime(2026, 9, 25, 15, 0, tzinfo=NY)
+    results = {}
+    for tz in ("UTC", "America/New_York", "Asia/Tokyo"):
+        monkeypatch.setenv("TZ", tz)
+        _time.tzset()
+        req = _lag_request(datetime(2026, 9, 25, 9, 30, tzinfo=NY), datetime(2026, 9, 25, 16, 0, tzinfo=NY), now)
+        results[tz] = (req.start.astimezone(NY), req.end.astimezone(NY), req.to_request_fields()["end"])
+    monkeypatch.delenv("TZ", raising=False)
+    _time.tzset()
+    assert len(set(results.values())) == 1, results
+    assert results["UTC"][1] == datetime(2026, 9, 25, 14, 44, tzinfo=NY)
 
 
 def test_minute_quality_detects_missing_duplicates_and_outside_session():

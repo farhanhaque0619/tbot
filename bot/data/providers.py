@@ -30,6 +30,41 @@ def sip_lagged_end(end: datetime, now: datetime, *, feed: str) -> datetime:
     return min(end, now - SIP_LAG) if feed == "sip" else end
 
 
+def alpaca_request_window(start: datetime, end: datetime, *, now: datetime | None, feed: str) -> tuple[datetime, datetime]:
+    """The ONE datetime convention for Alpaca bar requests: timezone-AWARE UTC instants for both start and end.
+
+    Naive inputs are New York wall-clock times (the bot's convention); aware inputs of any zone are kept as instants.
+    The SIP lag is applied to the end only for ``feed == "sip"``. Nothing here ever strips tzinfo: converting to UTC and
+    dropping the zone would let a later ``.astimezone()`` reinterpret the value in the host's local zone.
+    """
+    start = start if start.tzinfo is not None else start.replace(tzinfo=NY)
+    end = end if end.tzinfo is not None else end.replace(tzinfo=NY)
+    now = now if now is not None else datetime.now(NY)
+    now = now if now.tzinfo is not None else now.replace(tzinfo=NY)
+    end = sip_lagged_end(end, now, feed=feed)
+    return start.astimezone(UTC), end.astimezone(UTC)
+
+
+def _bars_request(symbol: str, timeframe, start_utc: datetime, end_utc: datetime, *, adjustment, feed):
+    """Build the SDK request from aware UTC bounds and keep them aware on the object.
+
+    alpaca-py 0.44 ``BaseTimeseriesDataRequest.__init__`` converts aware datetimes to NAIVE UTC; its serializer then
+    assumes naive means UTC, so the wire format is correct either way. Re-attaching UTC keeps the object's own fields
+    unambiguous for anything that inspects the request (logs, tests, reconciliation) regardless of the host timezone.
+    The serialized fields are identical with or without this step (verified in tests).
+    """
+    from alpaca.data.requests import StockBarsRequest
+
+    if start_utc.tzinfo is None or end_utc.tzinfo is None:
+        raise ValueError("Alpaca request bounds must be timezone-aware (use alpaca_request_window)")
+    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=timeframe, start=start_utc, end=end_utc, adjustment=adjustment, feed=feed)
+    if req.start is not None and req.start.tzinfo is None:
+        req.start = req.start.replace(tzinfo=UTC)
+    if req.end is not None and req.end.tzinfo is None:
+        req.end = req.end.replace(tzinfo=UTC)
+    return req
+
+
 def is_subscription_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "subscription" in text or getattr(exc, "status_code", None) == 403 and "permit" in text
@@ -60,22 +95,16 @@ class AlpacaBarProvider:
     def fetch_daily(self, symbol: str, start: date, end: date) -> pd.DataFrame:
         from alpaca.common.exceptions import APIError
         from alpaca.data.enums import Adjustment, DataFeed
-        from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
 
         # Free plan: SIP data must be >15 minutes old. Daily bars for today are not final until the
-        # close anyway, so we never ask for anything past "now - 16 min".
-        end_dt = min(datetime.combine(end, datetime.max.time(), NY),
-                     datetime.now(NY) - timedelta(minutes=16))
-        start_dt = datetime.combine(start, datetime.min.time(), NY)
+        # close anyway, so we never ask for anything past "now - 16 min" (aware UTC bounds, one convention).
         feed = DataFeed(self.settings.data_feed)
+        start_utc, end_utc = alpaca_request_window(datetime.combine(start, datetime.min.time(), NY), datetime.combine(end, datetime.max.time(), NY),
+                                                   now=datetime.now(NY), feed="sip")
 
         def _call(feed_: DataFeed):
-            req = StockBarsRequest(
-                symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
-                start=start_dt.astimezone(UTC), end=end_dt.astimezone(UTC),
-                adjustment=Adjustment(self.settings.data_adjustment), feed=feed_,
-            )
+            req = _bars_request(symbol, TimeFrame.Day, start_utc, end_utc, adjustment=Adjustment(self.settings.data_adjustment), feed=feed_)
             return self.client.get_stock_bars(req)
 
         try:
@@ -105,23 +134,18 @@ class AlpacaBarProvider:
         Basic plan; a subscription refusal is raised as DataPlanError (no silent fallback)."""
         from alpaca.common.exceptions import APIError
         from alpaca.data.enums import Adjustment, DataFeed
-        from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
 
         feed = feed or self.settings.data_feed
-        now = now or datetime.now(NY)
-        start = start if start.tzinfo else start.replace(tzinfo=NY)
-        end = end if end.tzinfo else end.replace(tzinfo=NY)
-        end = sip_lagged_end(end, now.astimezone(NY), feed=feed)
-        if end <= start:
+        start_utc, end_utc = alpaca_request_window(start, end, now=now, feed=feed)
+        if end_utc <= start_utc:
             return _empty()
-        req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, start=start.astimezone(UTC), end=end.astimezone(UTC),
-                               adjustment=Adjustment(self.settings.data_adjustment), feed=DataFeed(feed))
+        req = _bars_request(symbol, TimeFrame.Minute, start_utc, end_utc, adjustment=Adjustment(self.settings.data_adjustment), feed=DataFeed(feed))
         try:
             bars = with_retry(lambda: self.client.get_stock_bars(req), what=f"get_stock_bars_1m({symbol},{feed})")
         except APIError as e:
             if is_subscription_error(e):
-                raise DataPlanError(f"{feed} minute bars refused for {symbol} {start}..{end}: {e}") from e
+                raise DataPlanError(f"{feed} minute bars refused for {symbol} {start_utc.isoformat()}..{end_utc.isoformat()}: {e}") from e
             raise
         df = bars.df
         if df.empty:
