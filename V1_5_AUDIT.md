@@ -268,3 +268,11 @@ Sharpe 0.55, 56 trades.
 Other observations: the daemon booted, reconciled, adopted the orphan, persisted and exited 0; OTO and bracket orders
 were accepted with nested legs; OTO with OPG was refused locally as the tables say; OPG/CLS acceptance windows agreed
 with the API; the first `data fetch` found 2,713 cached daily bars per symbol from 2016-01-04 (the Alpaca floor).
+
+## 12. Second paper run (2026-10-18) — findings
+
+| # | Item | Observation | Change |
+|---|---|---|---|
+| D29 | confirmed | The paper API accepted a 0.1-share DAY stop (`test_fractional_day_stop_is_accepted` passed); the adopted QQQ orphan now carries a DAY stop and is reported `unprotected_overnight` as designed. | none |
+| D34 | Wash-trade rule | Paper rejected a sell stop while a buy limit rested on the same symbol: `40310000 potential wash trade detected. use complex orders`. This also means an add-on entry (M1 rebalance up) would be rejected while the slice's protective stop rests, and an OTO leg on the add-on would protect only the new shares. | OMS cancels the resting protective before an add-on entry, sends the add-on plain (no OTO), and re-places a full-size stop on fill; if the add-on expires or is rejected the stop is re-armed. Integration test cancels the limit before placing the stop. |
+| D35 | Baseline command | The operator ran `--start 2016-01-04` on my instruction; the frozen §2.1 command starts 2017-01-03. Totals differ (+44.31% / 0.65 / 11 trades vs +29.39% / 0.57 / 10) while every 2020→2026 walk-forward fold matches the frozen table to the decimal. Not a code change. | Re-run with the §2.1 command to confirm. |

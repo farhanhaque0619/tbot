@@ -57,6 +57,10 @@ def test_limit_stop_replace_cancel_whole_share(broker, orders_enabled, cid):
             # outside market hours the order is 'accepted' and Alpaca rejects a replace (42210000); we refuse locally
             with pytest.raises(OrderConstraintError, match="accepted"):
                 broker.replace_order(o.id, limit_price=round(lp * 0.99, 2))
+        # Alpaca rejects an opposite-side order while a limit rests on the same symbol (40310000 "potential wash trade"):
+        # cancel the buy limit before placing the sell stop, exactly as the OMS does before an add-on or exit
+        _cleanup(broker, created)
+        created = []
         st = broker.submit_stop_order(SYMBOL, 1, "sell", round(lp * 0.5, 2), cid + "-stp", "gtc")
         created.append(st)
         assert st.order_type == "stop" and st.time_in_force == "gtc"

@@ -222,3 +222,28 @@ def test_kill_switch_flatten_all_and_cancel_entries():
     assert {o.symbol for o in out} == {"SPY", "QQQ"} and all(o.kind == "flatten" for o in out)
     h.next_bar("SPY"); h.next_bar("QQQ")
     assert h.risk.ledger.open_positions() == 0
+
+
+def test_add_on_entry_cancels_resting_stop_and_reprotects_full_size():
+    h = Harness()
+    h.reconcile([h.target(10, stop=95.0)])
+    h.next_bar()
+    first_stop = h.oms.protective[("A", "SPY")]
+    recs = h.reconcile([h.target(15, stop=96.0)])          # add 5 while a sell stop rests: Alpaca would reject the buy
+    assert len(recs) == 1 and recs[0].kind == "entry" and recs[0].qty == 5
+    assert h.broker.orders[first_stop].status == "canceled" and ("A", "SPY") not in h.oms.protective
+    assert not any("OTO" in e for e in recs[0].events), "an add-on never uses an OTO leg (it would cover only the new shares)"
+    h.next_bar()
+    new_stop = h.oms.orders[h.oms.protective[("A", "SPY")]]
+    assert new_stop.qty == 15 and new_stop.stop_price == 96.0 and h.risk.ledger.slice("A", "SPY").qty == 15
+
+
+def test_add_on_entry_that_never_fills_rearms_the_stop():
+    h = Harness()
+    h.reconcile([h.target(10, stop=95.0)])
+    h.next_bar()
+    rec = h.reconcile([h.target(15, stop=96.0)])[0]
+    assert ("A", "SPY") not in h.oms.protective
+    h.oms.on_trade_update(TradeUpdateEvent(rec.broker_id, rec.client_order_id, "expired", h.broker.now, "SPY", "buy", 5, 0, None, "expired"), session=D)
+    stop = h.oms.orders[h.oms.protective[("A", "SPY")]]
+    assert stop.is_open and stop.qty == 10 and stop.stop_price == 96.0

@@ -142,9 +142,14 @@ class OrderManager:
             if is_exit:
                 qty = min(abs(delta), abs(sl.qty))
             style = t.exit_style if is_exit else t.entry_style
+            adding = (not is_exit) and abs(sl.qty) > 1e-12
             if is_exit:
                 # a resting protective stop and an exit could both fill: cancel the stop first, then submit the exit
                 self._cancel_protective(t.module_id, t.symbol, reason="module exit")
+            elif adding and (t.module_id, t.symbol) in self.protective:
+                # Alpaca rejects an order while an opposite-side open order exists for the symbol (40310000 "potential wash
+                # trade"); the resting stop is cancelled, the add-on goes in plain, and a full-size stop is re-placed on fill
+                self._cancel_protective(t.module_id, t.symbol, reason="add-on entry (opposite-side open order would be rejected)")
             style, tif, order_type, limit_price = self._translate_style(style, side, qty, prices.get(t.symbol, t.reference_price), spreads, t.symbol, now)
             if style is None:
                 self._decide(t, None, "waiting", f"style {t.exit_style if is_exit else t.entry_style} not eligible now")
@@ -172,7 +177,7 @@ class OrderManager:
                 continue
             self.orders[cid] = rec
             self.risk.ledger.inflight[cid] = (t.module_id, t.symbol, (1 if side == "buy" else -1) * qty * intent.reference_price)
-            protective = t.protective_stop_price if (kind == "entry" and t.overnight_ok and not self.software_stops) else None
+            protective = t.protective_stop_price if (kind == "entry" and t.overnight_ok and not self.software_stops and not adding) else None
             if self.store is not None:
                 self.store.begin_submit(rec)          # committed BEFORE the broker call (crash-safe: cid is deterministic)
             try:
@@ -317,11 +322,15 @@ class OrderManager:
             if ev.event == "fill":
                 self.risk.ledger.inflight.pop(rec.client_order_id, None)
                 if rec.kind == "entry":
-                    self._after_entry_fill(rec)
+                    self._after_entry_fill(rec)       # covers the WHOLE slice (an add-on re-protects the old quantity too)
                 if rec.kind in ("stop", "tp"):
                     self.protective.pop((rec.module_id, rec.symbol), None)
         elif ev.event in ("canceled", "expired", "rejected", "done_for_day"):
             self.risk.ledger.inflight.pop(rec.client_order_id, None)
+            if rec.kind == "entry" and rec.stop_price is not None and not self.software_stops:
+                key = (rec.module_id, rec.symbol)
+                if abs(self.risk.ledger.slice(*key).qty) > 1e-12 and key not in self.protective:
+                    self.place_protective(rec.module_id, rec.symbol, rec.stop_price)     # add-on never filled: re-arm the stop
             if rec.kind == "stop" and rec.protective_for:
                 key = (rec.module_id, rec.symbol)
                 sl = self.risk.ledger.slice(*key)
