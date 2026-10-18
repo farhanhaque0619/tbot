@@ -26,8 +26,11 @@ def test_fractional_orders_are_day_market_or_limit_and_simple_only():
     v(qty=0.5)
     v(qty=0.5, order_type="limit", limit_price=100.0)
     v(qty=None, notional=25.0)
+    v(qty=0.5, order_type="stop", stop_price=90.0)                    # a DAY stop is how a fractional position is protected
+    v(qty=0.5, side="sell", order_type="stop_limit", stop_price=90.0, limit_price=89.5)
     for kw in (dict(qty=0.5, tif="gtc"), dict(qty=0.5, tif="opg"), dict(qty=0.5, tif="cls"), dict(qty=None, notional=5.0, tif="gtc"),
-               dict(qty=0.5, order_type="stop", stop_price=90.0), dict(qty=0.5, order_class="oto", stop_price=90.0, base_price=100.0),
+               dict(qty=0.5, order_type="stop", stop_price=90.0, tif="gtc"), dict(qty=None, notional=5.0, order_type="stop", stop_price=90.0),
+               dict(qty=0.5, order_class="oto", stop_price=90.0, base_price=100.0),
                dict(qty=0.5, order_type="limit", limit_price=100.0, extended_hours=True)):
         with pytest.raises(OrderConstraintError):
             v(**kw)
@@ -90,6 +93,9 @@ def test_prices_round_to_tick_and_basic_field_checks():
 def test_can_replace_rules():
     ok = OrderInfo("1", "c", "SPY", "buy", 10, "new", 0, None, None, None)
     assert can_replace(ok) == (True, "")
+    assert can_replace(OrderInfo("1", "c", "SPY", "buy", 10, "partially_filled", 4, 100.0, None, None))[0]
+    queued = OrderInfo("1", "c", "SPY", "buy", 10, "accepted", 0, None, None, None)     # outside market hours
+    assert can_replace(queued)[0] is False and "accepted" in can_replace(queued)[1]
     notional = OrderInfo("2", "c", "SPY", "buy", 0, "new", 0, None, None, None, notional=25.0)
     assert can_replace(notional)[0] is False
     done = OrderInfo("3", "c", "SPY", "buy", 10, "filled", 10, 100.0, None, None)

@@ -254,3 +254,17 @@ STRATEGY_SPEC.md (Phase 3), LIVE_RUNBOOK.md (Phases 4–5), research/PROTOCOL.md
 NOT EVALUATED), deploy/README.md, V1_5_FINAL_REPORT.md. No logic changed in this phase. Test count: 334 offline, 12
 integration. Baselines re-verified once more before the tag: +95.72%, Sharpe 0.51, 26 trades; walk-forward +53.00%,
 Sharpe 0.55, 56 trades.
+
+## 11. First paper run (2026-10-18, operator's Mac) — findings
+
+| # | Item | Observation | Change |
+|---|---|---|---|
+| D29 | Fractional protective stop | The daemon adopted a 0.14 QQQ orphan and the local validator refused its DAY stop ("fractional orders must be market or limit"). That rule was stricter than spec §8 (DAY stop for fractional positions). | Validator now allows simple `stop`/`stop_limit` for fractional quantities with DAY tif (notional orders stay market/limit). `test_fractional_day_stop_is_accepted` (gated) asks the API; if it rejects, this row flips and fractional positions stay software-protected. |
+| D30 | Replace outside market hours | Paper answered `42210000 cannot replace order in accepted status` for a limit order submitted on a Sunday. | `can_replace` allows only `new`/`partially_filled`; the OMS re-price step runs only during the session anyway. The integration test accepts either path depending on the clock. |
+| D31 | Secrets in test output | pytest's long traceback printed the SDK request headers, i.e. the paper key pair. The operator was told to rotate. | `tests/conftest.py`: short tracebacks by default and a report hook that scrubs any credential-looking environment value. |
+| D32 | Re-attach alert | The daemon reported "protection re-attached" although the stop was rejected. | Alert now says re-attached only when the order is open, otherwise a critical "could NOT be re-attached". |
+| D33 | SP500 proxy on the operator's machine | `backtest --symbol SP500` asks Alpaca for a symbol that does not exist; the proxy exists only in the build container's cache. | None needed: the operator's frozen baselines are §2.1/§2.2 on SPY/QQQ. |
+
+Other observations: the daemon booted, reconciled, adopted the orphan, persisted and exited 0; OTO and bracket orders
+were accepted with nested legs; OTO with OPG was refused locally as the tables say; OPG/CLS acceptance windows agreed
+with the API; the first `data fetch` found 2,713 cached daily bars per symbol from 2016-01-04 (the Alpaca floor).

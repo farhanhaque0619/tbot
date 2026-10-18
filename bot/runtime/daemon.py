@@ -257,8 +257,11 @@ class Daemon:
                         if stop is None:
                             px = self.prices.get(s, sl.avg_price)
                             stop = px * (0.95 if sl.qty > 0 else 1.05)
-                        self.oms.place_protective(m, s, stop)
-                        self.alert("protection re-attached after restart", f"{s} {m}: stop {stop:.2f}", "warning")
+                        rec = self.oms.place_protective(m, s, stop)
+                        if rec is not None and rec.is_open:
+                            self.alert("protection re-attached after restart", f"{s} {m}: stop {stop:.2f}", "warning")
+                        else:
+                            self.alert("protection could NOT be re-attached after restart", f"{s} {m}: {rec.events[-1] if rec and rec.events else 'no order'}", "critical")
             if self.hub is not None:
                 self.hub.set_quote_symbols({s for (_, s), sl in self.risk.ledger.slices.items() if abs(sl.qty) > 1e-12} | {o.symbol for o in self.oms.orders.values() if o.is_open})
         if not rep.clean:

@@ -48,11 +48,15 @@ def test_limit_stop_replace_cancel_whole_share(broker, orders_enabled, cid):
     created = [o]
     try:
         assert o.order_type == "limit" and o.limit_price == lp and o.qty == 1
-        r = broker.replace_order(o.id, limit_price=round(lp * 0.99, 2))
-        created.append(r)
-        assert r.limit_price == round(lp * 0.99, 2)
-        back = broker.get_order_by_client_id(cid + "-lim")
-        assert back is not None and back.status in ("replaced", "new", "accepted", "pending_replace")
+        live = broker.get_order_by_client_id(cid + "-lim")
+        if live is not None and live.status in ("new", "partially_filled"):
+            r = broker.replace_order(o.id, limit_price=round(lp * 0.99, 2))
+            created.append(r)
+            assert r.limit_price == round(lp * 0.99, 2)
+        else:
+            # outside market hours the order is 'accepted' and Alpaca rejects a replace (42210000); we refuse locally
+            with pytest.raises(OrderConstraintError, match="accepted"):
+                broker.replace_order(o.id, limit_price=round(lp * 0.99, 2))
         st = broker.submit_stop_order(SYMBOL, 1, "sell", round(lp * 0.5, 2), cid + "-stp", "gtc")
         created.append(st)
         assert st.order_type == "stop" and st.time_in_force == "gtc"
@@ -97,3 +101,15 @@ def test_opg_cls_windows_match_the_api(broker, orders_enabled, cid):
                 assert ("09:28" in str(e)) or ("15:50" in str(e)), f"unexpected local refusal at {now}: {e}"
     finally:
         _cleanup(broker, created)
+
+
+def test_fractional_day_stop_is_accepted(broker, orders_enabled, cid):
+    """Spec §8 protects a fractional position with a DAY stop; verify the API accepts a fractional stop order at all
+    (a far-away buy stop needs no position). A rejection here means D29 in V1_5_AUDIT.md must change."""
+    q = broker.get_latest_quote("SPY")
+    px = q.mid if q else 500.0
+    o = broker.submit_stop_order("SPY", 0.1, "buy", round(px * 1.5, 2), cid + "-fstop", "day")
+    try:
+        assert o.order_type == "stop" and o.qty == pytest.approx(0.1) and o.time_in_force == "day" and o.status in ("new", "accepted", "pending_new", "held")
+    finally:
+        _cleanup(broker, [o])

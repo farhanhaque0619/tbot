@@ -1,6 +1,7 @@
 """Documented Alpaca order constraints, enforced in code BEFORE any API call (spec §8).
 
-Sources: Alpaca docs "Orders" (fractional trading: DAY only, market/limit only, no advanced order classes; extended
+Sources: Alpaca docs "Orders" (fractional trading: DAY only, simple market/limit/stop/stop-limit, no advanced order
+classes; a DAY stop is how a fractional position is protected, spec §8; extended
 hours: limit DAY/GTC only; OPG accepted before 09:28 or after 19:00 ET; CLS before 15:50 or after 19:00 ET; bracket/OTO
 stop and take-profit at least $0.01 away from the base price; prices in $0.01 ticks at or above $1, $0.0001 below;
 notional orders cannot be replaced). These are checks on what we send; the API remains the final authority and an
@@ -67,8 +68,8 @@ def validate_order(*, symbol: str, qty: float | None, side: str, order_type: str
     if fractional:
         if tif != "day":
             raise OrderConstraintError("fractional/notional orders must be DAY orders (no GTC, OPG, CLS, IOC, FOK)")
-        if order_type not in ("market", "limit"):
-            raise OrderConstraintError("fractional/notional orders must be market or limit orders")
+        if notional is not None and order_type not in ("market", "limit"):
+            raise OrderConstraintError("notional orders must be market or limit orders")
         if order_class != "simple":
             raise OrderConstraintError("fractional/notional orders cannot be part of a bracket or OTO")
         if extended_hours:
@@ -128,10 +129,18 @@ def validate_order(*, symbol: str, qty: float | None, side: str, order_type: str
     return out
 
 
+REPLACEABLE = ("new", "partially_filled")
+
+
 def can_replace(order) -> tuple[bool, str]:
-    """Alpaca cannot replace notional orders or orders that are no longer open."""
+    """Alpaca replaces only orders that are live at the exchange (``new`` / ``partially_filled``). Outside market hours an
+    order sits in ``accepted`` and the API answers 42210000 "cannot replace order in accepted status" (observed on
+    paper, 2026-10-18); notional orders and terminal orders cannot be replaced either."""
     if getattr(order, "notional", None) is not None and getattr(order, "qty", 0) in (0, None):
         return False, "notional orders cannot be replaced"
+    status = getattr(order, "status", "")
     if getattr(order, "is_terminal", False):
-        return False, f"order is {order.status}"
+        return False, f"order is {status}"
+    if status not in REPLACEABLE:
+        return False, f"order is {status!r}: Alpaca replaces only {REPLACEABLE} (outside market hours an order stays 'accepted')"
     return True, ""
